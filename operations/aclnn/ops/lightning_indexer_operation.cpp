@@ -5,7 +5,7 @@
 #include "lightning_indexer_operation.h"
 #include "operations/aclnn/utils/utils.h"
 #include "acl/acl.h"
-#include "aclnn_lightning_indexer.h"
+#include "aclnnop/aclnn_lightning_indexer.h"
 #include "atb_speed/log.h"
 
 namespace atb_speed {

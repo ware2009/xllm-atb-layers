@@ -23,6 +23,7 @@
 #include "aclnnop/aclnn_matmul_all_reduce.h"
 #include "atb_speed/log.h"
 #include "operations/aclnn/utils/utils.h"
+#include "hccl/hccl_comm.h"
 
 namespace atb_speed {
 namespace common {

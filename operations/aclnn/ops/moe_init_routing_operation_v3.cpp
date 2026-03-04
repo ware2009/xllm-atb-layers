@@ -17,7 +17,7 @@
 #include <securec.h>
 #include <sstream>
 #include "acl/acl.h"
-#include "aclnn_moe_init_routing_v3.h"
+#include "aclnnop/aclnn_moe_init_routing_v3.h"
 #include "atb_speed/log.h"
 #include "atb_speed/utils/timer.h"
 #include "operations/aclnn/utils/utils.h"
