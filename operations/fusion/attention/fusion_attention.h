@@ -19,6 +19,7 @@
 
 #include <vector>
 #include <map>
+#include <memory>
 #include <atb/atb_infer.h>
 #include "atb_speed/log.h"
 #include "atb_speed/utils/operation_util.h"
@@ -27,6 +28,7 @@
 #include "operations/fusion/norm/norm_linear.h"
 #include "operations/fusion/embedding/positional_embedding.h"
 #include "operations/aclnn/ops/attn_operation.h"
+#include "operations/aclnn/ops/fused_infer_attention_v2.h"
 
 namespace atb_speed {
 namespace common {
@@ -169,6 +171,8 @@ struct FusionAttentionParam {
     atb::infer::ReshapeAndCacheOmniParam  reshapeCacheOmniParm;
     /// Parameters for the attention operation from the AclNN backend (used in the decode phase)
     atb_speed::common::AclNNAttnParam aclnnIncreAttentionParam;
+    atb_speed::common::AclNNFusedInferAttnParam aclnnFusedInferAttnParam;
+    std::shared_ptr<int> bs = std::make_shared<int>(0);
     // self out linear param
     /// A flag indicating whether dense linear has bias
     bool selfAttnHasBias = false;
@@ -207,6 +211,9 @@ struct FusionAttentionParam {
     int32_t layerId = 0;
     // enable acl graph
     bool enableAclGraphPagedAttention = false;
+    bool needUpdateKVCache = true;
+    bool isOneRecEncoder = false;
+    bool isOneRecDecoder = false;
 };
 
 template <typename NormParamType>
@@ -328,6 +335,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(const FusionAttentionParam<No
 /// \endcode
 template <typename NormParamType>
 atb::Status Attention(const FusionAttentionParam<NormParamType> &param, atb::Operation **operation);
+
+template <typename NormParamType>
+atb::Status CrossAttention(const FusionAttentionParam<NormParamType> &param, atb::Operation **operation);
 } // namespace common
 } // namespace atb_speed
 #endif

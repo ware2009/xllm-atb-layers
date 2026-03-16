@@ -38,7 +38,7 @@ int64_t AddSelfAttention(
         ss << "tensor name: " << tensor->first << ", tensor id: " << tensor->second << std::endl;
     }
     ATB_SPEED_LOG_DEBUG("layer map tensor:\n" << ss.str());
-    if (!param.enableRopeQuantKvcache) {
+    if (!param.enableRopeQuantKvcache && param.needUpdateKVCache) {
         if (!param.isFA) {  // Paged Attention path
             if (param.enableXattention && !param.isPrefill) {
                 // Decode phase for unified decode-kv-cache pipeline.
