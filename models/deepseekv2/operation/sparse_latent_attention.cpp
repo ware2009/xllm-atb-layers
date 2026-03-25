@@ -17,6 +17,9 @@
 #include "atb_speed/base/model.h"
 #include "operations/fusion/utils.h"
 #include "operations/aclrt/ops/aclrt_cmo_async.h"
+#include "operations/aclnn/ops/aclnn_rope_operation.h"
+#include "operations/aclnn/ops/concat_operation.h"
+#include "operations/aclnn/ops/split_with_size_operation.h"
 #include "operations/aclnn/ops/repeat_operation.h"
 #include "operations/aclnn/ops/lightning_indexer_operation.h"
 #include "operations/aclnn/ops/sparse_flash_attention_operation.h"
@@ -90,8 +93,14 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnInTensorCandidates(
             "in_q_quant_scale", "in_k_quant_scale", "in_qk_descale",
             "kv_offset", "fa3_v_quant_scale"}
         },
-        {"attn_cp_prefill", {"in_seq_len_cp", "in_cp_load_balance_idx_first", "in_cp_load_balance_idx_last",
-                             "in_cp_o_recover_idx", "in_cp_kv_recover_idx"}},
+        {"attn_cp_prefill", {
+            // "in_seq_len_cp",
+            // "in_cp_load_balance_idx_first", "in_cp_load_balance_idx_last",
+            "cp_o_recover_idx", "cp_kv_recover_idx", "cp_load_balance_idx",
+            "k_gather_index_prev", "k_gather_index_next",
+            "actual_seq_lengths_query_prev", "actual_seq_lengths_query_next",
+            "actual_seq_lengths_key_prev", "actual_seq_lengths_key_next"
+        }},
         {"attn_inner_sp_decode", {"in_seq_len_sp"}},
         {"qkvdown_dp", {"in_ffn_unpadding_idx"}
         },
@@ -131,13 +140,25 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
         {"mla_preprocess", {"intermediate_q_nope", "intermediate_self_attention", "intermediate_q_rope"}},
         {"kv_quant_scale", {"intermediate_kv_int8"}},
         {"attn_cp_prefill", {
-            "intermediate_kv_cp", "rope_k_o_cp", "intermediate_kv_cp_s", "rope_k_o_cp_s",
-            "intermediate_kv_rope_concat", "intermediate_kv_rope_concat_allgather",
-            "intermediate_k_mha_cp", "intermediate_v_mha_cp",
-            "intermediate_q_first", "intermediate_q_last", "intermediate_k_first", "intermediate_k_last",
-            "intermediate_q_nope_cp", "intermediate_q_rope_cp", "intermediate_k_nope_cp", "intermediate_k_rope_cp",
-            "intermediate_v_first", "intermediate_v_last", "intermediate_o_first", "intermediate_o_last",
-            "intermediate_lse_first", "intermediate_lse_last", "intermediate_o_concat"}},
+            "intermediate_kv_cp", "intermediate_kv_allgather", 
+            "rope_k_o_cp", "rope_k_o_allgather",
+            // "in_cos_embed_allgather", "in_cos_embed_allgather_s",
+            // "in_sin_embed_allgather", "in_sin_embed_allgather_s",
+            "indexer_k_out_allgather", "indexer_k_out_allgather_s",
+            "indexer_q_out_balance", "indexer_weight_out_balance",
+            "indexer_q_out_prev", "indexer_q_out_next",
+            "indexer_weight_out_prev", "indexer_weight_out_next",
+            "indexer_k_out_prev", "indexer_k_out_next",
+            "intermediate_topk_indices_prev_cat", "intermediate_topk_indices_next_cat",
+            "intermediate_topk_indices_balance", "intermediate_topk_indices_prev", "intermediate_topk_indices_next",
+            "intermediate_topk_indices_draft",
+            "intermediate_q_balance", "intermediate_q_prev", "intermediate_q_next",
+            "rope_q_o_balance", "rope_q_o_prev", "rope_q_o_next",
+            "intermediate_kv_prev", "intermediate_kv_next",
+            "rope_k_o_prev", "rope_k_o_next",
+            "intermediate_self_attention_prev", "intermediate_self_attention_next",
+            "intermediate_self_attention_draft"
+        }},
         {"attn_cp_decode", {"intermediate_go_lse_allgather"}},
         {"attn_inner_sp_decode", {
             "intermediate_q", "intermediate_q_allgather_sp", "intermediate_q_allgather_sp_t",
@@ -228,15 +249,10 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
     // using MATMUL_EIN_SUM, skip trans
     // AddTensorToList(latentAttnIntermediateTensorCandidates, "orpoj_transpose", intermediateTensorList);
 
-    if (!param.isPrefill && (param.contextParallelInfo.IsEnabled() || param.hasAttnInnerSp)) {
-        AddTensorToList(latentAttnIntermediateTensorCandidates, "fa_update", intermediateTensorList);
-    }
     if (param.contextParallelInfo.IsEnabled()) {
         if (param.isPrefill) {
             AddTensorToList(latentAttnInTensorCandidates, "attn_cp_prefill", inTensorList);
             AddTensorToList(latentAttnIntermediateTensorCandidates, "attn_cp_prefill", intermediateTensorList);
-        } else {
-            AddTensorToList(latentAttnIntermediateTensorCandidates, "attn_cp_decode", intermediateTensorList);
         }
     }
     if (param.hasAttnInnerSp && !param.isPrefill) {
@@ -283,6 +299,83 @@ void SqueezeHeadNumHeadDim(const atb::Dims &oldShape, atb::Dims &newShape)
         newShape.dims[0] = oldShape.dims[0];  // 0, 0: translatedshapetranslated0translated
         newShape.dims[1] =  oldShape.dims[1] * oldShape.dims[2];  // 1, 1, 2: translated
     }
+}
+
+void UnSqueezeHeadNumHeadDim(const atb::Dims &oldShape, atb::Dims &newShape, int headDim)
+{
+    if (oldShape.dimNum == 2) {
+        newShape.dimNum = 3;
+        newShape.dims[0] = oldShape.dims[0];
+        newShape.dims[1] = oldShape.dims[1] / headDim;
+        newShape.dims[2] = headDim;
+    }
+    else {
+        newShape = oldShape;
+    }
+}
+
+template <typename NormParamType>
+atb::Status AddSfaAllGatherAndReorderCpNode(const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap, std::string in, std::string inter, std::string out, std::string idx)
+{
+    atb::Node allGatherNode;
+    atb::infer::AllGatherParam allGatherParam;
+    allGatherParam.rank = param.contextParallelInfo.rank;
+    allGatherParam.rankSize = param.contextParallelInfo.rankIds.size();
+    allGatherParam.backend = param.contextParallelInfo.defaultBackend;
+    param.contextParallelInfo.InitCommDomain(allGatherParam.hcclComm, allGatherParam.commDomain);
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(allGatherParam, &allGatherNode.operation));
+    allGatherNode.inTensorIds = GetTensorIdxList(tensorMap, {in});
+    allGatherNode.outTensorIds = GetTensorIdxList(tensorMap, {inter});
+    opGraph.nodes.push_back(allGatherNode);
+
+    atb::Node nopeGatherNode;
+    atb::infer::GatherParam nopeGatherParam;
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(nopeGatherParam, &nopeGatherNode.operation));
+    nopeGatherNode.inTensorIds = GetTensorIdxList(tensorMap, {inter, idx});
+    nopeGatherNode.outTensorIds = {GetTensorIdx(tensorMap, out)};
+    nopeGatherNode.inTensorReshapeFuncs.resize(nopeGatherNode.inTensorIds.size());
+    nopeGatherNode.inTensorReshapeFuncs[0] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+        // Squeeze oldShape dim 0,1 into one dimension
+        newShape.dimNum = oldShape.dimNum - 1;
+        newShape.dims[0] = oldShape.dims[0] * oldShape.dims[1];
+        for (int i = 1; i < newShape.dimNum; ++i) {
+            newShape.dims[i] = oldShape.dims[i + 1];
+        }
+    };
+    opGraph.nodes.push_back(nopeGatherNode);
+
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddSfaGatherCpNode(const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap, std::string in, std::string out, std::string idx)
+{
+    atb::Node nopeGatherNode;
+    atb::infer::GatherParam nopeGatherParam;
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(nopeGatherParam, &nopeGatherNode.operation));
+    nopeGatherNode.inTensorIds = GetTensorIdxList(tensorMap, {in, idx});
+    nopeGatherNode.outTensorIds = {GetTensorIdx(tensorMap, out)};
+    opGraph.nodes.push_back(nopeGatherNode);
+
+    return atb::NO_ERROR;
+}
+
+template<typename NormParamType>
+atb::Status AddSfaSplitCpNode(const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
+                           std::map<std::string, uint32_t> &tensorMap, std::string in, std::string out_p, std::string out_n)
+{
+    atb::Node splitKNode;
+    atb::infer::SplitParam splitKParam = {0, 2};
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(splitKParam, &splitKNode.operation));
+    splitKNode.inTensorIds = {GetTensorIdx(tensorMap, in)};
+    splitKNode.outTensorIds = {
+        GetTensorIdx(tensorMap, out_p), GetTensorIdx(tensorMap, out_n)
+    };
+    opGraph.nodes.push_back(splitKNode);
+
+    return atb::NO_ERROR;
 }
 
 template <typename NormParamType>
@@ -455,6 +548,12 @@ atb::Status AddSplitQKNode(const LatentAttentionParam<NormParamType> &param, atb
     splitKNode.outTensorIds = {
         GetTensorIdx(tensorMap, "intermediate_kv"), GetTensorIdx(tensorMap, "rope_k"), GetTensorIdx(tensorMap, "latent_q"),
     };
+    
+    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+        splitKNode.outTensorIds = {
+            GetTensorIdx(tensorMap, "intermediate_kv_cp"), GetTensorIdx(tensorMap, "rope_k"), GetTensorIdx(tensorMap, "latent_q"),
+        };
+    }
     opGraph.nodes.push_back(splitKNode);
     ATB_SPEED_LOG_DEBUG("MLA spilt_qk calculation success");
     return atb::NO_ERROR;
@@ -672,15 +771,57 @@ atb::Status AddLAttnKVNormNode(const LatentAttentionParam<NormParamType> &param,
     if (!param.isFA) {
         kvNormNode.inTensorReshapeFuncs.resize(kvNormNode.inTensorIds.size());
         kvNormNode.inTensorReshapeFuncs[0] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-            newShape.dimNum = 3; // 3: dimNum
-            newShape.dims[0] = oldShape.dims[0];
-            newShape.dims[1] = 1;
-            newShape.dims[2] = param.kvLoraRank; // 2: dim id
+            UnSqueezeHeadNumHeadDim(oldShape, newShape, param.kvLoraRank);
         };
     }
     CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(param.normParamType, &kvNormNode.operation));
     opGraph.nodes.push_back(kvNormNode);
     ATB_SPEED_LOG_DEBUG("MLA kv norm calculation success");
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddSfaRopeCpNode(const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
+{
+    atb::Node ropeQNode;
+    atb_speed::common::AclnnRopeParam ropeParam;
+    ropeParam.mode = 1;
+    ropeQNode.operation = new atb_speed::common::AclnnRopeOperation("RopeQNode", ropeParam);
+    ropeQNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "rope_q"),
+        GetTensorIdx(tensorMap, "in_cos_embed"), GetTensorIdx(tensorMap, "in_sin_embed")
+    };
+
+    ropeQNode.outTensorIds = {
+        GetTensorIdx(tensorMap, "rope_q_o")
+    };
+    ropeQNode.inTensorReshapeFuncs.resize(ropeQNode.inTensorIds.size());
+    for(auto i = 0; i < ropeQNode.inTensorIds.size(); i++){
+        ropeQNode.inTensorReshapeFuncs[i] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+            UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
+        };
+    }
+    opGraph.nodes.push_back(ropeQNode);
+    atb::Node ropeKNode;
+    ropeKNode.operation = new atb_speed::common::AclnnRopeOperation("RopeKNode", ropeParam);
+    ropeKNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "rope_k"),
+        GetTensorIdx(tensorMap, "in_cos_embed_allgather_s"), GetTensorIdx(tensorMap, "in_sin_embed_allgather_s")
+    };
+
+    ropeKNode.outTensorIds = {
+        GetTensorIdx(tensorMap, "rope_k_o")
+    };
+    ropeKNode.inTensorReshapeFuncs.resize(ropeKNode.inTensorIds.size());
+    for(auto i = 0; i < ropeKNode.inTensorIds.size(); i++){
+        ropeKNode.inTensorReshapeFuncs[i] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+            UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
+        };
+    }
+    opGraph.nodes.push_back(ropeKNode);
+    ATB_SPEED_LOG_DEBUG("Sfa rope calculation success");
+
     return atb::NO_ERROR;
 }
 
@@ -701,6 +842,11 @@ atb::Status AddLAttnRopeNode(const LatentAttentionParam<NormParamType> &param,
     ropeNode.outTensorIds = {
         GetTensorIdx(tensorMap, "rope_q_o"), GetTensorIdx(tensorMap, "rope_k_o"),
     };
+    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+        ropeNode.outTensorIds = {
+            GetTensorIdx(tensorMap, "rope_q_o"), GetTensorIdx(tensorMap, "rope_k_o_cp"),
+        };
+    }
     ropeNode.inTensorReshapeFuncs.resize(ropeNode.inTensorIds.size());
     ropeNode.inTensorReshapeFuncs[0] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
         SqueezeHeadNumHeadDim(oldShape, newShape);
@@ -710,214 +856,10 @@ atb::Status AddLAttnRopeNode(const LatentAttentionParam<NormParamType> &param,
     return atb::NO_ERROR;
 }
 
-
-template <typename NormParamType>
-atb::Status AddKAllGatherCpNode(const LatentAttentionParam<NormParamType> &param,
-                                atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
-{
-    // [bs,1,dc] + [bs,1,dr] -> [bs,1,dc+dr]
-    atb::Node catNode;
-    atb::infer::ConcatParam catParam;
-    catParam.concatDim = -1;
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(catParam, &catNode.operation));
-    catNode.inTensorIds = {GetTensorIdxList(tensorMap, {"intermediate_kv", "rope_k_o"})};
-    catNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_kv_rope_concat")};
-    catNode.inTensorReshapeFuncs.resize(catNode.inTensorIds.size());
-    catNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        // [bs,dr] -> [bs,1,dr]
-        newShape.dimNum = 3; // 3: dimNum
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = 1;
-        newShape.dims[2] = oldShape.dims[1]; // 2: dim id
-    };
-    opGraph.nodes.push_back(catNode);
-
-    // [bs,1,dc+dr] -> [cp,bs,1,dc+dr]
-    atb::Node allGatherNode;
-    atb::infer::AllGatherParam allGatherParam;
-    allGatherParam.rank = param.contextParallelInfo.rank;
-    allGatherParam.rankSize = param.contextParallelInfo.rankIds.size();
-    allGatherParam.backend = param.contextParallelInfo.defaultBackend;
-    param.contextParallelInfo.InitCommDomain(allGatherParam.hcclComm, allGatherParam.commDomain);
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(allGatherParam, &allGatherNode.operation));
-    allGatherNode.inTensorIds = GetTensorIdxList(tensorMap, {"intermediate_kv_rope_concat"});
-    allGatherNode.outTensorIds = GetTensorIdxList(tensorMap, {"intermediate_kv_rope_concat_allgather"});
-    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsBeforeComm(opGraph));
-    opGraph.nodes.push_back(allGatherNode);
-    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsAfterComm(opGraph));
-
-    // [cp*bs,1,dc+dr] -> [cp*bs,1,dc] + [cp*bs,1,dr]
-    atb::Node splitNode;
-    atb::infer::SplitParam splitParam;
-    splitParam.splitDim = 2; // 2: dim num
-    splitParam.splitSizes = {param.kvLoraRank, param.qkRopeHeadDim};
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(splitParam, &splitNode.operation));
-    splitNode.inTensorIds = {GetTensorIdx(tensorMap, "intermediate_kv_rope_concat_allgather")};
-    splitNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_kv_cp"),
-                              GetTensorIdx(tensorMap, "rope_k_o_cp")};
-    splitNode.inTensorReshapeFuncs.resize(splitNode.inTensorIds.size());
-    splitNode.inTensorReshapeFuncs[0] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        // [cp,bs,1,dc+dr] -> [cp*bs,1,dc+dr]
-        newShape.dimNum = 3; // 3: dim num
-        newShape.dims[0] = oldShape.dims[0] * oldShape.dims[1];
-        newShape.dims[1] = oldShape.dims[2]; // 2: dim id
-        newShape.dims[2] = oldShape.dims[3]; // 2, 3: dim id
-    };
-    opGraph.nodes.push_back(splitNode);
-
-    return atb::NO_ERROR;
-}
-
-
-template <typename NormParamType>
-atb::Status AddLAttnQCatNode(const LatentAttentionParam<NormParamType> &param,
-    atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node qCatNode;
-    atb::infer::ConcatParam qCatParam;
-    qCatParam.concatDim = -1;
-    if (param.isPrefill) {
-        qCatNode.inTensorIds = {
-            GetTensorIdx(tensorMap, "nope_q"), GetTensorIdx(tensorMap, "rope_q_o")};
-    } else {
-        qCatNode.inTensorIds = {
-            GetTensorIdx(tensorMap, param.enableMlaPreprocess ? "intermediate_q_nope" : "reproj_nope_q"),
-            GetTensorIdx(tensorMap, param.enableMlaPreprocess ? "intermediate_q_rope" : "rope_q_o")
-        };
-    }
-    qCatNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_q")};
-    qCatNode.inTensorReshapeFuncs.resize(qCatNode.inTensorIds.size());
-    if (param.isFA) {
-        qCatNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-            newShape.dimNum = 4; // 4: dimNum
-            newShape.dims[0] = oldShape.dims[0];
-            newShape.dims[1] = oldShape.dims[1];
-            newShape.dims[2] = param.selfAttentionParam.headNum; // 2: dim id
-            newShape.dims[3] = param.qkRopeHeadDim; // 3: dim id
-        };
-    } else {
-        qCatNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-            newShape.dimNum = 3; // 3: dimNum
-            newShape.dims[0] = oldShape.dims[0];
-            newShape.dims[1] = param.selfAttentionParam.headNum;
-            newShape.dims[2] = param.qkRopeHeadDim; // 2: dim id
-        };
-    }
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(qCatParam, &qCatNode.operation));
-    opGraph.nodes.push_back(qCatNode);
-    ATB_SPEED_LOG_DEBUG("MLA qCatNode calculation success");
-    return atb::NO_ERROR;
-}
-
-
-template <typename NormParamType>
-atb::Status AddLAttnKCatPrefillNode(const LatentAttentionParam<NormParamType> &param,
-    atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node keyRepeatNode;
-    atb_speed::common::AclNNRepeatParam kvRepeatParam;
-    kvRepeatParam.repeatsArray = {1, param.selfAttentionParam.headNum, 1};
-    keyRepeatNode.inTensorIds = {GetTensorIdx(tensorMap, "rope_k_o")};
-    keyRepeatNode.outTensorIds = {GetTensorIdx(tensorMap, "rope_k_o_repeat")};
-    keyRepeatNode.inTensorReshapeFuncs.resize(keyRepeatNode.inTensorIds.size());
-    keyRepeatNode.inTensorReshapeFuncs[0] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 3; // 3: dim id
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = 1;
-        newShape.dims[2] = oldShape.dims[1]; // 2:dim id
-    };
-    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
-        keyRepeatNode.inTensorIds[0] = GetTensorIdx(tensorMap, "rope_k_o_cp");
-        keyRepeatNode.inTensorReshapeFuncs[0] = nullptr;
-    }
-    keyRepeatNode.operation = new atb_speed::common::RepeatOperation("RepeatNode", kvRepeatParam);
-    opGraph.nodes.push_back(keyRepeatNode);
-
-    atb::Node kCatNode;
-    atb::infer::ConcatParam kCatParam;
-    kCatParam.concatDim = 2; // 2: dim id
-    kCatNode.inTensorIds = {
-        GetTensorIdx(tensorMap, "intermediate_k_nope"), GetTensorIdx(tensorMap, "rope_k_o_repeat")};
-    kCatNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_k_mha")};
-    kCatNode.inTensorReshapeFuncs.resize(kCatNode.inTensorIds.size());
-    kCatNode.inTensorReshapeFuncs[0] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 3; // 3: dim id
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = param.selfAttentionParam.headNum;
-        newShape.dims[2] = param.qkNopeHeadDim; // 2:dim id
-    };
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(kCatParam, &kCatNode.operation));
-    opGraph.nodes.push_back(kCatNode);
-    ATB_SPEED_LOG_DEBUG("MLA kCatNode prefill calculation success");
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
-atb::Status AddLAttnKRopeRepeatNode(const LatentAttentionParam<NormParamType> &param,
-    atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node keyRepeatNode;
-    atb_speed::common::AclNNRepeatParam kvRepeatParam;
-    kvRepeatParam.repeatsArray = {1, param.selfAttentionParam.headNum, 1};
-    keyRepeatNode.inTensorIds = {GetTensorIdx(tensorMap, "rope_k_o")};
-    keyRepeatNode.outTensorIds = {GetTensorIdx(tensorMap, "rope_k_o_repeat")};
-    keyRepeatNode.inTensorReshapeFuncs.resize(keyRepeatNode.inTensorIds.size());
-    keyRepeatNode.inTensorReshapeFuncs[0] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 3; // 3: dim id
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = 1;
-        newShape.dims[2] = oldShape.dims[1]; // 2:dim id
-    };
-    keyRepeatNode.operation = new atb_speed::common::RepeatOperation("RepeatNode", kvRepeatParam);
-    opGraph.nodes.push_back(keyRepeatNode);
-
-    ATB_SPEED_LOG_DEBUG("MLA kCatNode prefill calculation success");
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
-atb::Status AddLAttnKRopeRepeatHistoryNode(const LatentAttentionParam<NormParamType> &param,
-    atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node keyRepeatNode;
-    atb_speed::common::AclNNRepeatParam kvRepeatParam;
-    kvRepeatParam.repeatsArray = {1, param.selfAttentionParam.headNum, 1};
-    keyRepeatNode.inTensorIds = {GetTensorIdx(tensorMap, "in_history_k_rope")};
-    keyRepeatNode.outTensorIds = {GetTensorIdx(tensorMap, "rope_k_o_repeat_history")};
-    keyRepeatNode.inTensorReshapeFuncs.resize(keyRepeatNode.inTensorIds.size());
-    keyRepeatNode.inTensorReshapeFuncs[0] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 3; // 3: dim id
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = 1;
-        newShape.dims[2] = oldShape.dims[1]; // 2:dim id
-    };
-    keyRepeatNode.operation = new atb_speed::common::RepeatOperation("RepeatNode", kvRepeatParam);
-    opGraph.nodes.push_back(keyRepeatNode);
-
-    ATB_SPEED_LOG_DEBUG("MLA AddLAttnKRopeRepeatHistoryNode calculation success");
-    return atb::NO_ERROR;
-}
-
 template <typename NormParamType>
 atb::Status AddReshapeAndCacheNode(const LatentAttentionParam<NormParamType> &param,
     atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
 {
-    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
-        atb::Node nopeGatherNode;
-        atb::infer::GatherParam nopeGatherParam;
-        CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(nopeGatherParam, &nopeGatherNode.operation));
-        nopeGatherNode.inTensorIds = GetTensorIdxList(tensorMap, {"intermediate_kv_cp", "in_cp_kv_recover_idx"});
-        nopeGatherNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_kv_cp_s")};
-        opGraph.nodes.push_back(nopeGatherNode);
-
-        atb::Node ropeGatherNode;
-        atb::infer::GatherParam ropeGatherParam;
-        CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(ropeGatherParam, &ropeGatherNode.operation));
-        ropeGatherNode.inTensorIds = GetTensorIdxList(tensorMap, {"rope_k_o_cp", "in_cp_kv_recover_idx"});
-        ropeGatherNode.outTensorIds = {GetTensorIdx(tensorMap, "rope_k_o_cp_s")};
-        opGraph.nodes.push_back(ropeGatherNode);
-    }
-
     atb::Node reshapeAndCacheNode;
     CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(param.reshapeCacheParm, &reshapeAndCacheNode.operation));
     reshapeAndCacheNode.inTensorIds = {
@@ -932,16 +874,8 @@ atb::Status AddReshapeAndCacheNode(const LatentAttentionParam<NormParamType> &pa
     };
     reshapeAndCacheNode.inTensorReshapeFuncs.resize(reshapeAndCacheNode.inTensorIds.size());
     reshapeAndCacheNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 3; // 3: dim num
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = 1;
-        newShape.dims[2] = oldShape.dims[1]; // 2: dim id
+        UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
     };
-    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
-        reshapeAndCacheNode.inTensorIds[0] = GetTensorIdx(tensorMap, "intermediate_kv_cp_s");
-        reshapeAndCacheNode.inTensorIds[1] = GetTensorIdx(tensorMap, "rope_k_o_cp_s");
-        reshapeAndCacheNode.inTensorReshapeFuncs[1] = nullptr;
-    }
     opGraph.nodes.push_back(reshapeAndCacheNode);
     return atb::NO_ERROR;
 }
@@ -1125,70 +1059,6 @@ atb::Status AddLAttnVProjBAfterTransposeNode(const LatentAttentionParam<NormPara
         &transposeVProjBAfterNode.operation));
     opGraph.nodes.push_back(transposeVProjBAfterNode);
     ATB_SPEED_LOG_DEBUG("MLA proj_k_b output transpose calculation success");
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
-atb::Status AddLAttnVProjBNodeTransposeWeightNode(const LatentAttentionParam<NormParamType> &param,
-    atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node transposeVProjBWeightNode;
-    atb::infer::TransposeParam transposeVProjBWeightParam;
-    transposeVProjBWeightNode.inTensorIds = {GetTensorIdx(tensorMap, "in_v_proj_b_for_o_weight")};
-    transposeVProjBWeightNode.outTensorIds = {GetTensorIdx(tensorMap, "temp_v_proj_b")};
-    if (param.isFA) {
-        transposeVProjBWeightParam.perm = {0, 1, 3, 2};
-    } else {
-        transposeVProjBWeightParam.perm = {0, 2, 1};
-    }
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(transposeVProjBWeightParam,
-        &transposeVProjBWeightNode.operation));
-    opGraph.nodes.push_back(transposeVProjBWeightNode);
-    ATB_SPEED_LOG_DEBUG("MLA proj_k_b weight transpose calculation success");
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
-atb::Status AddLAttnVProjBNode(const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
-    std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node vProjBNode;
-    atb_speed::common::FusionLinearParam vProjBNodeParam;
-    vProjBNodeParam.isBF16 = param.isBF16;
-    vProjBNodeParam.hasBias = param.selfAttnHasBias;
-    vProjBNodeParam.quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED ?
-            param.packQuantType : param.denseQuantType,
-        param.attnLinearQuantType[KV_PROJ_B_FOR_V_LINEAR_INDEX], false);
-    vProjBNodeParam.quantGroupSize = param.quantGroupSize;
-    vProjBNodeParam.transposeType = param.attnLinearTransposeType[KV_PROJ_B_FOR_V_LINEAR_INDEX];
-    CHECK_OPERATION_STATUS_RETURN(FusionLinear(vProjBNodeParam, &vProjBNode.operation));
-    vProjBNode.inTensorIds = {
-        GetTensorIdx(tensorMap, "intermediate_kv"),
-        GetTensorIdx(tensorMap, "temp_v_proj_b"),
-        GetTensorIdx(tensorMap, "in_v_proj_b_for_o_scale"),
-        GetTensorIdx(tensorMap, "in_v_proj_b_for_o_offset"),
-        GetTensorIdx(tensorMap, "in_v_proj_b_for_o_descale"),
-        GetTensorIdx(tensorMap, "in_v_proj_b_for_o_bias"),
-        GetTensorIdx(tensorMap, "in_v_proj_b_for_o_compress_idx"),
-    };
-    vProjBNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_v_mha")};
-    vProjBNode.inTensorReshapeFuncs.resize(vProjBNode.inTensorIds.size());
-    vProjBNode.inTensorReshapeFuncs[0] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 2; // 2: dim num
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = oldShape.dims[2]; // 2: dim id
-    };
-    vProjBNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 2; // 2: dim num
-        newShape.dims[0] = oldShape.dims[0] * oldShape.dims[1];
-        newShape.dims[1] = oldShape.dims[2]; // 2: dim id
-    };
-    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
-        vProjBNode.inTensorIds[0] = GetTensorIdx(tensorMap, "intermediate_kv_cp");
-    }
-    opGraph.nodes.push_back(vProjBNode);
-    ATB_SPEED_LOG_DEBUG("MLA proj_v_b calculation success");
     return atb::NO_ERROR;
 }
 
@@ -1772,6 +1642,14 @@ atb::Status AddIndexerKReshapeAndCacheNode(const LatentAttentionParam<NormParamT
         GetTensorIdx(tensorMap, "in_k_cache_indexer"),
         GetTensorIdx(tensorMap, "in_slots_in_pa_or_logn_in_fa"),
     };
+    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+        kreshapeAndCacheNode.inTensorIds = {
+            GetTensorIdx(tensorMap, "indexer_k_out_allgather_s"),
+            GetTensorIdx(tensorMap, "in_k_cache_indexer"),
+            GetTensorIdx(tensorMap, "in_slots_in_pa_or_logn_in_fa"),
+        };
+    }
+    
     kreshapeAndCacheNode.outTensorIds = {
         GetTensorIdx(tensorMap, "in_k_cache_indexer"),
     };
@@ -1813,6 +1691,61 @@ atb::Status AddIndexerWeightNode(const LatentAttentionParam<NormParamType> &para
 }
 
 template <typename NormParamType>
+atb::Status AddLightIndexerCpNode(const LatentAttentionParam<NormParamType> &param,
+                                atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
+{
+    atb::Node lightIndexerNode1;
+    atb_speed::common::LightningIndexerParam lightIndexerParam;
+    lightIndexerParam.keyLayout = "TND";
+    lightIndexerNode1.operation = new atb_speed::common::LightningIndexerOperation(
+        "AclNNLightningIndexerNode", lightIndexerParam
+    );
+    lightIndexerNode1.inTensorIds = {
+        GetTensorIdx(tensorMap, "indexer_q_out_prev"),
+        GetTensorIdx(tensorMap, "indexer_k_out_prev"),
+        GetTensorIdx(tensorMap, "indexer_weight_out_prev"),
+        GetTensorIdx(tensorMap, "actual_seq_lengths_query_prev"),
+        GetTensorIdx(tensorMap, "actual_seq_lengths_key_prev")
+    };
+    lightIndexerNode1.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_topk_indices_prev_cat")};
+    lightIndexerNode1.inTensorReshapeFuncs.resize(lightIndexerNode1.inTensorIds.size());
+    lightIndexerNode1.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+        UnSqueezeHeadNumHeadDim(oldShape, newShape, oldShape.dims[oldShape.dimNum - 1]);
+    };
+    opGraph.nodes.push_back(lightIndexerNode1);
+    
+    atb::Node lightIndexerNode2;
+    lightIndexerNode2.operation = new atb_speed::common::LightningIndexerOperation(
+        "AclNNLightningIndexerNode", lightIndexerParam
+    );
+    lightIndexerNode2.inTensorIds = {
+        GetTensorIdx(tensorMap, "indexer_q_out_next"),
+        GetTensorIdx(tensorMap, "indexer_k_out_next"),
+        GetTensorIdx(tensorMap, "indexer_weight_out_next"),
+        GetTensorIdx(tensorMap, "actual_seq_lengths_query_next"),
+        GetTensorIdx(tensorMap, "actual_seq_lengths_key_next")
+    };
+    lightIndexerNode2.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_topk_indices_next_cat")};
+    lightIndexerNode2.inTensorReshapeFuncs.resize(lightIndexerNode2.inTensorIds.size());
+    lightIndexerNode2.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+        UnSqueezeHeadNumHeadDim(oldShape, newShape, oldShape.dims[oldShape.dimNum - 1]);
+    };
+    opGraph.nodes.push_back(lightIndexerNode2);
+    
+    atb::Node aclnnConcatNode;
+    atb_speed::common::AclNNConcatParam aclNNConcatParam;
+    aclNNConcatParam.dim = 0;
+    aclnnConcatNode.operation = new atb_speed::common::ConcatOperation("concatindex", aclNNConcatParam);
+    aclnnConcatNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "intermediate_topk_indices_prev_cat"),
+        GetTensorIdx(tensorMap, "intermediate_topk_indices_next_cat")};
+    aclnnConcatNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_topk_indices_draft")};
+    opGraph.nodes.push_back(aclnnConcatNode);
+
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
 atb::Status AddLightIndexerNode(const LatentAttentionParam<NormParamType> &param,
                                 atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
 {
@@ -1850,45 +1783,152 @@ atb::Status AddSparseFlashAttentionNode(
     sparseFlashAttentionNode.operation = new atb_speed::common::SparseFlashAttentionOperation(
         "AclNNSparseFlashAttentionNode", sparseFlashAttentionParam
     );
+    auto q_nope = ""; 
+    auto q_pe = ""; 
     if (param.isPrefill || !param.enableMlaPreprocess) {
-        sparseFlashAttentionNode.inTensorIds = {
-            GetTensorIdx(tensorMap, "intermediate_q_t"),
-            GetTensorIdx(tensorMap, "in_k_cache"),
-            GetTensorIdx(tensorMap, "in_k_cache"),
-            GetTensorIdx(tensorMap, "intermediate_topk_indices"),
-            GetTensorIdx(tensorMap, "in_block_tables"),
-            GetTensorIdx(tensorMap, "in_seq_len_query"),
-            GetTensorIdx(tensorMap, "in_seq_len"),
-            GetTensorIdx(tensorMap, "rope_q_o"),
-            GetTensorIdx(tensorMap, "in_k_rope_cache"),
-        };
+        q_nope = "intermediate_q_t";
+        q_pe = "rope_q_o";
     } else {
-        sparseFlashAttentionNode.inTensorIds = {
-            GetTensorIdx(tensorMap, "intermediate_q_nope"),
-            GetTensorIdx(tensorMap, "in_k_cache"),
-            GetTensorIdx(tensorMap, "in_k_cache"),
-            GetTensorIdx(tensorMap, "intermediate_topk_indices"),
-            GetTensorIdx(tensorMap, "in_block_tables"),
-            GetTensorIdx(tensorMap, "in_seq_len_query"),
-            GetTensorIdx(tensorMap, "in_seq_len"),
-            GetTensorIdx(tensorMap, "intermediate_q_rope"),
-            GetTensorIdx(tensorMap, "in_k_rope_cache"),
-        };
+        q_nope = "intermediate_q_nope";
+        q_pe = "intermediate_q_rope";
     }
+    sparseFlashAttentionNode.inTensorIds = {
+        GetTensorIdx(tensorMap, q_nope),
+        GetTensorIdx(tensorMap, "in_k_cache"),
+        GetTensorIdx(tensorMap, "in_k_cache"),
+        GetTensorIdx(tensorMap, "intermediate_topk_indices"),
+        GetTensorIdx(tensorMap, "in_block_tables"),
+        GetTensorIdx(tensorMap, "in_seq_len_query"),
+        GetTensorIdx(tensorMap, "in_seq_len"),
+        GetTensorIdx(tensorMap, q_pe),
+        GetTensorIdx(tensorMap, "in_k_rope_cache"),
+    };
     sparseFlashAttentionNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_self_attention")};
-    sparseFlashAttentionNode.operation = new atb_speed::common::SparseFlashAttentionOperation(
-        "AclNNSparseFlashAttentionNode", sparseFlashAttentionParam
-    );
     if (param.isPrefill || !param.enableMlaPreprocess) {
         sparseFlashAttentionNode.inTensorReshapeFuncs.resize(sparseFlashAttentionNode.inTensorIds.size());
         sparseFlashAttentionNode.inTensorReshapeFuncs[7] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-            newShape.dimNum = 3;
-            newShape.dims[0] = oldShape.dims[0];
-            newShape.dims[1] = param.selfAttentionParam.headNum;
-            newShape.dims[2] = oldShape.dims[1] / param.selfAttentionParam.headNum;
+            UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
         };
     }
     opGraph.nodes.push_back(sparseFlashAttentionNode);
+    ATB_SPEED_LOG_DEBUG("SparseFlashAttention calculation success");
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddSparseFlashAttentionCpNode(
+    const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    // knope, kpe gathersplit - "k_gather_index"               | pre/next
+    CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+        "intermediate_kv", "intermediate_kv_prev", "k_gather_index_prev"));
+    CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+        "intermediate_kv", "intermediate_kv_next", "k_gather_index_next"));
+    CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+        "rope_k_o", "rope_k_o_prev", "k_gather_index_prev"));
+    CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+        "rope_k_o", "rope_k_o_next", "k_gather_index_next"));
+
+    // qnope,qpe,topk gather&split - "cp_load_balance_idx"   | pre/next
+    CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+        "intermediate_q_t", "intermediate_q_balance", "cp_load_balance_idx"));
+    CHECK_OPERATION_STATUS_RETURN(AddSfaSplitCpNode(param, opGraph, tensorMap,
+        "intermediate_q_balance", "intermediate_q_prev", "intermediate_q_next"));
+    CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+        "rope_q_o", "rope_q_o_balance", "cp_load_balance_idx"));
+    CHECK_OPERATION_STATUS_RETURN(AddSfaSplitCpNode(param, opGraph, tensorMap,
+        "rope_q_o_balance", "rope_q_o_prev", "rope_q_o_next"));
+    CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+        "intermediate_topk_indices", "intermediate_topk_indices_balance", "cp_load_balance_idx"));
+    //CHECK_OPERATION_STATUS_RETURN(AddSfaSplitCpNode(param, opGraph, tensorMap,
+    //    "intermediate_topk_indices_balance", "intermediate_topk_indices_prev", "intermediate_topk_indices_next"));
+    
+    atb::Node aclnnSplitNode;
+    atb_speed::common::AclNNSplitWithSizeParam aclNNSplitParam;
+    aclNNSplitParam.dim = 0;
+    aclNNSplitParam.num = 2;
+    aclnnSplitNode.operation = new atb_speed::common::SplitWithSizeOperation("splitindex", aclNNSplitParam);
+    aclnnSplitNode.inTensorIds = {GetTensorIdx(tensorMap, "intermediate_topk_indices_balance")};
+    aclnnSplitNode.outTensorIds = {
+        GetTensorIdx(tensorMap, "intermediate_topk_indices_prev"),
+        GetTensorIdx(tensorMap, "intermediate_topk_indices_next")};
+    opGraph.nodes.push_back(aclnnSplitNode);
+
+    // get actual seq_lengths_query/seq_lengths_key 
+    //      actual_seq_lengths_query_prev / actual_seq_lengths_key_prev
+
+    atb_speed::common::SparseFlashAttentionParam sparseFlashAttentionParam;
+    sparseFlashAttentionParam.queryLayout = "TND";
+    sparseFlashAttentionParam.kvLayout = "TND";
+    sparseFlashAttentionParam.scaleValue = param.softmaxScale;
+    sparseFlashAttentionParam.sparseBlockSize = 1;
+    sparseFlashAttentionParam.hasBlockTable = false;
+
+    atb::Node sparseFlashAttentionPrevNode;
+    sparseFlashAttentionPrevNode.operation = new atb_speed::common::SparseFlashAttentionOperation(
+        "AclNNsparseFlashAttentionPrevNode", sparseFlashAttentionParam
+    );
+    sparseFlashAttentionPrevNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "intermediate_q_prev"),
+        GetTensorIdx(tensorMap, "intermediate_kv_prev"),
+        GetTensorIdx(tensorMap, "intermediate_kv_prev"),
+        GetTensorIdx(tensorMap, "intermediate_topk_indices_prev"),
+        GetTensorIdx(tensorMap, "in_block_tables"),
+        GetTensorIdx(tensorMap, "actual_seq_lengths_query_prev"),
+        GetTensorIdx(tensorMap, "actual_seq_lengths_key_prev"),
+        GetTensorIdx(tensorMap, "rope_q_o_prev"),
+        GetTensorIdx(tensorMap, "rope_k_o_prev"),
+    };
+    sparseFlashAttentionPrevNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_self_attention_prev")};
+    sparseFlashAttentionPrevNode.inTensorReshapeFuncs.resize(sparseFlashAttentionPrevNode.inTensorIds.size());
+    sparseFlashAttentionPrevNode.inTensorReshapeFuncs[7] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+        UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
+    };
+    sparseFlashAttentionPrevNode.inTensorReshapeFuncs[8] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+        UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
+    };
+    opGraph.nodes.push_back(sparseFlashAttentionPrevNode);
+    
+    atb::Node sparseFlashAttentionNextNode;
+    sparseFlashAttentionNextNode.operation = new atb_speed::common::SparseFlashAttentionOperation(
+        "AclNNsparseFlashAttentionNextNode", sparseFlashAttentionParam
+    );
+    sparseFlashAttentionNextNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "intermediate_q_next"),
+        GetTensorIdx(tensorMap, "intermediate_kv_next"),
+        GetTensorIdx(tensorMap, "intermediate_kv_next"),
+        GetTensorIdx(tensorMap, "intermediate_topk_indices_next"),
+        GetTensorIdx(tensorMap, "in_block_tables"),
+        GetTensorIdx(tensorMap, "actual_seq_lengths_query_next"),
+        GetTensorIdx(tensorMap, "actual_seq_lengths_key_next"),
+        GetTensorIdx(tensorMap, "rope_q_o_next"),
+        GetTensorIdx(tensorMap, "rope_k_o_next"),
+    };
+    sparseFlashAttentionNextNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_self_attention_next")};
+    sparseFlashAttentionNextNode.inTensorReshapeFuncs.resize(sparseFlashAttentionNextNode.inTensorIds.size());
+    sparseFlashAttentionNextNode.inTensorReshapeFuncs[7] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+        UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
+    };
+    sparseFlashAttentionNextNode.inTensorReshapeFuncs[8] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+        UnSqueezeHeadNumHeadDim(oldShape, newShape, param.qkRopeHeadDim);
+    };
+    opGraph.nodes.push_back(sparseFlashAttentionNextNode);
+    
+    atb::Node indexCatNode;
+    atb::infer::ConcatParam sfaCatParam;
+    sfaCatParam.concatDim = 0;
+    indexCatNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "intermediate_self_attention_prev"),
+        GetTensorIdx(tensorMap, "intermediate_self_attention_next")};
+    indexCatNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_self_attention_draft")};
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(sfaCatParam, &indexCatNode.operation));
+    opGraph.nodes.push_back(indexCatNode);
+    
+    // attn & cat & rerank - "cp_o_recover_idx"
+    CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+        "intermediate_self_attention_draft", "intermediate_self_attention", "cp_o_recover_idx"));
+        
     ATB_SPEED_LOG_DEBUG("SparseFlashAttention calculation success");
     return atb::NO_ERROR;
 }
@@ -1925,385 +1965,6 @@ atb::Status AddReprojVTransposeNode(const LatentAttentionParam<NormParamType> &p
     return atb::NO_ERROR;
 }
 
-template <typename NormParamType>
-atb::Status AddQAllGatherTp2Sp(const LatentAttentionParam<NormParamType> &param,
-    atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node allGatherNode;
-    atb::infer::AllGatherParam allGatherParam;
-    allGatherParam.rank = param.attnSpRank;
-    allGatherParam.rankSize = param.attnSpSize;
-    allGatherParam.backend = param.attnSpBackend;
-    allGatherParam.rankTableFile = param.attnSpRankTableFile;
-    allGatherParam.commDomain = param.attnSpDomain;
-    allGatherParam.hcclComm = param.attnSpHcclComm;
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(allGatherParam, &allGatherNode.operation));
-
-    allGatherNode.inTensorIds = GetTensorIdxList(tensorMap, {"intermediate_q"});
-    allGatherNode.outTensorIds = GetTensorIdxList(tensorMap, {"intermediate_q_allgather_sp_t"});
-    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsBeforeComm(opGraph));
-    opGraph.nodes.push_back(allGatherNode);
-    CHECK_OPERATION_STATUS_RETURN(common::AddDapEventsAfterComm(opGraph));
-
-    atb::Node transposeNode;
-    atb::infer::TransposeParam transposeParam;
-    transposeParam.perm = {1, 0, 2, 3}; // sp, B, N/tp, D -> B, sp, N/tp, D
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(transposeParam, &transposeNode.operation));
-
-    transposeNode.inTensorIds = GetTensorIdxList(tensorMap, {"intermediate_q_allgather_sp_t"});
-    transposeNode.outTensorIds = GetTensorIdxList(tensorMap, {"intermediate_q_allgather_sp"});
-    opGraph.nodes.push_back(transposeNode);
-    
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
-atb::Status AddPaEncoderNode(
-    const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
-    std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node selfAttentionNode;
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(param.selfAttentionParam, &selfAttentionNode.operation));
-    selfAttentionNode.inTensorIds = {
-        GetTensorIdx(tensorMap, "intermediate_q"),
-        GetTensorIdx(tensorMap, "intermediate_k_mha"),
-        GetTensorIdx(tensorMap, "intermediate_v_mha"),
-    };
-    if (param.selfAttentionParam.maskType != atb::infer::SelfAttentionParam::MASK_TYPE_UNDEFINED) {
-        selfAttentionNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "in_attention_mask"));
-    }
-    selfAttentionNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "in_seq_len"));
-    selfAttentionNode.inTensorReshapeFuncs.resize(selfAttentionNode.inTensorIds.size());
-    selfAttentionNode.inTensorReshapeFuncs[2] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 3; // 3: dim num
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = param.selfAttentionParam.headNum;
-        newShape.dims[2] = param.qkNopeHeadDim; // 2: dim id
-    };
-    selfAttentionNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_self_attention")};
-    opGraph.nodes.push_back(selfAttentionNode);
-    ATB_SPEED_LOG_DEBUG("PA encoder calculation success");
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
-atb::Status AddRingMLAEncoderNode(
-    const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
-    std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node ringAttentionNode;
-    atb::infer::RingMLAParam ringMLaParam;
-    ringMLaParam.calcType = atb::infer::RingMLAParam::CalcType::CALC_TYPE_FISRT_RING;
-    ringMLaParam.headNum = param.selfAttentionParam.headNum;
-    ringMLaParam.kvHeadNum = param.selfAttentionParam.kvHeadNum;
-    ringMLaParam.qkScale = param.selfAttentionParam.qkScale;
-    ringMLaParam.maskType = atb::infer::RingMLAParam::MaskType::MASK_TYPE_TRIU;
-    
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(ringMLaParam, &ringAttentionNode.operation));
-    ringAttentionNode.inTensorIds = {
-        GetTensorIdx(tensorMap, "nope_q"),
-        GetTensorIdx(tensorMap, "rope_q_o"),
-        GetTensorIdx(tensorMap, "intermediate_k_nope"),
-        GetTensorIdx(tensorMap, "rope_k_o_repeat"),
-        GetTensorIdx(tensorMap, "intermediate_v_mha"),
-        GetTensorIdx(tensorMap, "in_attention_mask"),
-        GetTensorIdx(tensorMap, "ring_cur_seqlen"),
-    };
-    
-    ringAttentionNode.inTensorReshapeFuncs.resize(ringAttentionNode.inTensorIds.size());
-    ringAttentionNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-            newShape.dimNum = 3; // 3: dimNum
-            newShape.dims[0] = oldShape.dims[0];
-            newShape.dims[1] = param.selfAttentionParam.headNum;
-            newShape.dims[2] = param.qkRopeHeadDim; // 2: dim id
-    };
-    ringAttentionNode.inTensorReshapeFuncs[2] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 3; // 3: dim num
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = param.selfAttentionParam.headNum;
-        newShape.dims[2] = param.qkNopeHeadDim; // 2: dim id
-    };
-    ringAttentionNode.inTensorReshapeFuncs[4] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 3; // 3: dim num
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = param.selfAttentionParam.headNum;
-        newShape.dims[2] = param.qkNopeHeadDim; // 2: dim id
-    };
-    ringAttentionNode.outTensorIds = {GetTensorIdx(tensorMap, "cur_intermediate_self_attention"), \
-        GetTensorIdx(tensorMap, "cur_lse")};
-    opGraph.nodes.push_back(ringAttentionNode);
-    ATB_SPEED_LOG_DEBUG("PA encoder ringAttentionNode calculation success");
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
-atb::Status AddRingMLAEncoderHistoryNode(
-    const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
-    std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node ringAttentionNode;
-    atb::infer::RingMLAParam ringMLaParam;
-    ringMLaParam.calcType = atb::infer::RingMLAParam::CalcType::CALC_TYPE_DEFAULT;
-    ringMLaParam.headNum = param.selfAttentionParam.headNum;
-    ringMLaParam.kvHeadNum = param.selfAttentionParam.kvHeadNum;
-    ringMLaParam.qkScale = param.selfAttentionParam.qkScale;
-    ringMLaParam.maskType = atb::infer::RingMLAParam::MaskType::NO_MASK;
-    
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(ringMLaParam, &ringAttentionNode.operation));
-    ringAttentionNode.inTensorIds = {
-        GetTensorIdx(tensorMap, "nope_q"),
-        GetTensorIdx(tensorMap, "rope_q_o"),
-        GetTensorIdx(tensorMap, "intermediate_k_nope_history"),
-        GetTensorIdx(tensorMap, "rope_k_o_repeat_history"),
-        GetTensorIdx(tensorMap, "intermediate_v_mha_history"),
-        GetTensorIdx(tensorMap, "in_attention_mask"),
-        GetTensorIdx(tensorMap, "ring_cache_seqlen"),
-        GetTensorIdx(tensorMap, "cur_intermediate_self_attention"),
-        GetTensorIdx(tensorMap, "cur_lse"),
-    };
-    
-    ringAttentionNode.inTensorReshapeFuncs.resize(ringAttentionNode.inTensorIds.size());
-    ringAttentionNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-            newShape.dimNum = 3; // 3: dimNum
-            newShape.dims[0] = oldShape.dims[0];
-            newShape.dims[1] = param.selfAttentionParam.headNum;
-            newShape.dims[2] = param.qkRopeHeadDim; // 2: dim id
-    };
-    ringAttentionNode.inTensorReshapeFuncs[2] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 3; // 3: dim num
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = param.selfAttentionParam.headNum;
-        newShape.dims[2] = param.qkNopeHeadDim; // 2: dim id
-    };
-    ringAttentionNode.inTensorReshapeFuncs[4] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 3; // 3: dim num
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = param.selfAttentionParam.headNum;
-        newShape.dims[2] = param.qkNopeHeadDim; // 2: dim id
-    };
-    ringAttentionNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_self_attention"), \
-        GetTensorIdx(tensorMap, "cache_lse")};
-    opGraph.nodes.push_back(ringAttentionNode);
-    ATB_SPEED_LOG_DEBUG("PA encoder AddRingMLAEncoderHistoryNode calculation success");
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
-atb::Status AddEncoderMLANode(
-    const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
-    std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node selfAttentionNode;
-    atb::infer::MultiLatentAttentionParam multiLatentAttentionParam;
-    multiLatentAttentionParam.headNum = param.selfAttentionParam.headNum;
-    multiLatentAttentionParam.qkScale = param.selfAttentionParam.qkScale;
-    multiLatentAttentionParam.kvHeadNum = param.selfAttentionParam.kvHeadNum;
-    if (param.selfAttentionParam.maskType == atb::infer::SelfAttentionParam::MaskType::MASK_TYPE_NORM) {
-        multiLatentAttentionParam.maskType = atb::infer::MultiLatentAttentionParam::MaskType::MASK_TYPE_MASK_FREE;
-    }
-
-    multiLatentAttentionParam.calcType = atb::infer::MultiLatentAttentionParam::CalcType::CALC_TYPE_PREFILL;
-    multiLatentAttentionParam.cacheMode = atb::infer::MultiLatentAttentionParam::CacheMode::KROPE_CTKV;
-
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(multiLatentAttentionParam, &selfAttentionNode.operation));
-    selfAttentionNode.inTensorIds = {GetTensorIdx(tensorMap, "nope_q"), GetTensorIdx(tensorMap, "rope_q_o"),
-        GetTensorIdx(tensorMap, "intermediate_k_nope"), GetTensorIdx(tensorMap, "rope_k_o_repeat"),
-        GetTensorIdx(tensorMap, "intermediate_v_mha"), GetTensorIdx(tensorMap, "in_seq_len"),
-        GetTensorIdx(tensorMap, "in_seq_len")};
-    if (param.selfAttentionParam.maskType != atb::infer::SelfAttentionParam::MASK_TYPE_UNDEFINED) {
-        selfAttentionNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "in_attention_mask"));
-    }
-    selfAttentionNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_self_attention")};
-
-    selfAttentionNode.inTensorReshapeFuncs.resize(selfAttentionNode.inTensorIds.size());
-    selfAttentionNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 3; // 3: dimNum
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = param.selfAttentionParam.headNum;
-        newShape.dims[2] = param.qkRopeHeadDim; // 2: dimID
-    };
-    for (int i = 1; i < 5; i++) {  // 5: inTensorNum
-        selfAttentionNode.inTensorReshapeFuncs[i] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-            newShape.dimNum = 3; // 3: dimNum
-            newShape.dims[0] = oldShape.dims[0];
-            newShape.dims[1] = param.selfAttentionParam.headNum;
-            newShape.dims[2] = (i == 1 || i == 3) ? param.qkRopeHeadDim : param.qkNopeHeadDim;  // 2:dimId 3:inTensorId
-        };
-    }
-    opGraph.nodes.push_back(selfAttentionNode);
-    ATB_SPEED_LOG_DEBUG("MLA encoder calculation success");
-    return atb::NO_ERROR;
-}
-
-
-template <typename NormParamType>
-atb::Status AddQSplitNode(const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
-    std::map<std::string, uint32_t> &tensorMap)
-{
-    // [B, N, dc+dr] --> [B, N, dc]  [B, N, dr]
-    atb::Node splitNode;
-    atb::infer::SplitParam splitParam;
-    splitParam.splitDim = 2; // 2: position os dc+dr
-    splitParam.splitSizes = {param.kvLoraRank, param.qkRopeHeadDim};
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(splitParam, &splitNode.operation));
-    splitNode.inTensorIds = {GetTensorIdx(tensorMap, "intermediate_q_allgather_sp")};
-    splitNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_q_sp_nope"),
-                              GetTensorIdx(tensorMap, "intermediate_q_sp_rope")};
-    splitNode.inTensorReshapeFuncs.resize(splitNode.inTensorIds.size());
-    splitNode.inTensorReshapeFuncs[0] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 3; // 3: [B, tp, N/tp, D] -> [B, N, D]
-        newShape.dims[0] = oldShape.dims[0];
-        newShape.dims[1] = oldShape.dims[1] * oldShape.dims[2]; // 2: dim id
-        newShape.dims[2] = oldShape.dims[3]; // 2, 3: dim id
-    };
-    opGraph.nodes.push_back(splitNode);
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
-atb::Status AddMlaDecoderNode(
-    const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
-    std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node selfAttentionNode;
-    if (!param.enableCustomizeMla) {
-        atb::infer::MultiLatentAttentionParam multiLatentAttentionParam;
-        multiLatentAttentionParam.headNum = param.pageAttentionParam.headNum;
-        multiLatentAttentionParam.qkScale = param.pageAttentionParam.qkScale;
-        multiLatentAttentionParam.kvHeadNum = param.pageAttentionParam.kvHeadNum;
-        multiLatentAttentionParam.maskType = atb::infer::MultiLatentAttentionParam::MaskType::UNDEFINED;
-        multiLatentAttentionParam.calcType = (param.hasAttnInnerSp || param.contextParallelInfo.IsEnabled()) ?
-            atb::infer::MultiLatentAttentionParam::CalcType::CALC_TYPE_RING :
-            atb::infer::MultiLatentAttentionParam::CalcType::CALC_TYPE_UNDEFINED;
-        if (param.pageAttentionParam.maskType == atb::infer::PagedAttentionParam::MaskType::MASK_TYPE_SPEC) {
-            multiLatentAttentionParam.maskType = atb::infer::MultiLatentAttentionParam::MaskType::MASK_TYPE_SPEC;
-        } else if (param.pageAttentionParam.maskType == atb::infer::PagedAttentionParam::MaskType::MASK_TYPE_NORM) {
-            multiLatentAttentionParam.maskType = atb::infer::MultiLatentAttentionParam::MaskType::MASK_TYPE_MASK_FREE;
-        }
-        if (param.pageAttentionParam.calcType == atb::infer::PagedAttentionParam::CalcType::CALC_TYPE_SPEC) {
-            multiLatentAttentionParam.calcType = atb::infer::MultiLatentAttentionParam::CalcType::CALC_TYPE_SPEC;
-        }
-        if (EnableFA3Quant(param)) {
-            multiLatentAttentionParam.cacheMode = atb::infer::MultiLatentAttentionParam::CacheMode::INT8_NZCACHE;
-        } else if (param.isNzCache) {
-            multiLatentAttentionParam.cacheMode = atb::infer::MultiLatentAttentionParam::CacheMode::NZCACHE;
-        } else {
-            multiLatentAttentionParam.cacheMode = atb::infer::MultiLatentAttentionParam::CacheMode::KROPE_CTKV;
-        }
-
-        CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(multiLatentAttentionParam, &selfAttentionNode.operation));
-        selfAttentionNode.inTensorIds = {
-            GetTensorIdx(tensorMap, param.enableMlaPreprocess ? "intermediate_q_nope" : "reproj_nope_q"),
-            GetTensorIdx(tensorMap, param.enableMlaPreprocess ? "intermediate_q_rope" : "rope_q_o"),
-            GetTensorIdx(tensorMap, "in_k_cache"),
-            GetTensorIdx(tensorMap, "in_k_rope_cache"),
-            GetTensorIdx(tensorMap, "in_block_tables"),
-            GetTensorIdx(tensorMap, "in_seq_len")
-        };
-    } else {
-        atb_speed::common::AclNNMultiLatentAttentionParam multiLatentAttentionParam;
-        multiLatentAttentionParam.headNum = param.pageAttentionParam.headNum;
-        multiLatentAttentionParam.qkScale = param.pageAttentionParam.qkScale;
-        multiLatentAttentionParam.kvHeadNum = param.pageAttentionParam.kvHeadNum;
-        multiLatentAttentionParam.maskType = atb_speed::common::AclNNMultiLatentAttentionParam::MaskType::UNDEFINED;
-        multiLatentAttentionParam.calcType = param.hasAttnInnerSp ?
-            atb_speed::common::AclNNMultiLatentAttentionParam::CalcType::CALC_TYPE_RING :
-            atb_speed::common::AclNNMultiLatentAttentionParam::CalcType::CALC_TYPE_UNDEFINED;
-        if (param.pageAttentionParam.maskType == atb::infer::PagedAttentionParam::MaskType::MASK_TYPE_SPEC) {
-            multiLatentAttentionParam.maskType = atb_speed::common::AclNNMultiLatentAttentionParam::MaskType::MASK_TYPE_SPEC;
-        } else if (param.pageAttentionParam.maskType == atb::infer::PagedAttentionParam::MaskType::MASK_TYPE_NORM) {
-            multiLatentAttentionParam.maskType = atb_speed::common::AclNNMultiLatentAttentionParam::MaskType::MASK_TYPE_MASK_FREE;
-        }
-        if (param.pageAttentionParam.calcType == atb::infer::PagedAttentionParam::CalcType::CALC_TYPE_SPEC) {
-            multiLatentAttentionParam.calcType = atb_speed::common::AclNNMultiLatentAttentionParam::CalcType::CALC_TYPE_SPEC;
-        }
-        if (EnableFA3Quant(param)) {
-            multiLatentAttentionParam.cacheMode = atb_speed::common::AclNNMultiLatentAttentionParam::CacheMode::INT8_NZCACHE;
-        } else if (param.isNzCache) {
-            multiLatentAttentionParam.cacheMode = atb_speed::common::AclNNMultiLatentAttentionParam::CacheMode::NZCACHE;
-        } else {
-            multiLatentAttentionParam.cacheMode = atb_speed::common::AclNNMultiLatentAttentionParam::CacheMode::KROPE_CTKV;
-        }
-        //  CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(multiLatentAttentionParam, &selfAttentionNode.operation));
-        selfAttentionNode.operation = new MultiLatentAttentionOperation("multilatentattentionNode", multiLatentAttentionParam);
-        selfAttentionNode.inTensorIds = {
-            GetTensorIdx(tensorMap, param.enableMlaPreprocess ? "intermediate_q_nope" : "reproj_nope_q"),
-            GetTensorIdx(tensorMap, param.enableMlaPreprocess ? "intermediate_q_rope" : "rope_q_o"),
-            GetTensorIdx(tensorMap, "in_k_cache"),
-            GetTensorIdx(tensorMap, "in_k_rope_cache"),
-            GetTensorIdx(tensorMap, "in_block_tables"),
-            GetTensorIdx(tensorMap, "in_seq_len")
-        };
-    }
-    // reshape
-    selfAttentionNode.inTensorReshapeFuncs.resize(selfAttentionNode.inTensorIds.size());
-    selfAttentionNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        if (oldShape.dimNum == 2) { // 2: dim num
-            newShape.dimNum = 3; // 3: dim num
-            newShape.dims[0] = oldShape.dims[0];
-            newShape.dims[1] = param.selfAttentionParam.headNum;
-            newShape.dims[2] = oldShape.dims[1] / newShape.dims[1]; // 2: dim id
-        } else {
-            newShape = oldShape;
-        }
-    };
-    if (param.pageAttentionParam.maskType != atb::infer::PagedAttentionParam::MaskType::UNDEFINED) {
-        selfAttentionNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "in_attention_mask"));
-    }
-    if (param.pageAttentionParam.calcType == atb::infer::PagedAttentionParam::CalcType::CALC_TYPE_SPEC) {
-        selfAttentionNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "in_q_len"));
-    }
-    if (EnableFA3Quant(param)) {
-        selfAttentionNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "in_qk_descale"));
-        selfAttentionNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "fa3_v_quant_scale"));
-    }
-    if (!param.enableMlaPreprocess) {
-        selfAttentionNode.inTensorReshapeFuncs.resize(selfAttentionNode.inTensorIds.size());
-        selfAttentionNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-            newShape.dimNum = 3; // 3: dimNum
-            newShape.dims[0] = oldShape.dims[0];
-            newShape.dims[1] = param.selfAttentionParam.headNum;
-            newShape.dims[2] = param.qkRopeHeadDim; // 2: dim id
-        };
-    }
-    selfAttentionNode.outTensorIds = {GetTensorIdx(tensorMap, "reproj_o")};
-
-    if (param.hasAttnInnerSp) {
-        selfAttentionNode.inTensorIds.at(0) = GetTensorIdx(tensorMap, "intermediate_q_sp_nope");
-        selfAttentionNode.inTensorIds.at(1) = GetTensorIdx(tensorMap, "intermediate_q_sp_rope");
-        selfAttentionNode.inTensorIds.at(5) = GetTensorIdx(tensorMap, "in_seq_len_sp"); // 5:position of in_seq_len_sp
-    }
-    if (param.contextParallelInfo.IsEnabled() || param.hasAttnInnerSp) {
-        selfAttentionNode.outTensorIds = GetTensorIdxList(tensorMap, {"intermediate_go", "intermediate_lse"});
-    }
-    
-    opGraph.nodes.push_back(selfAttentionNode);
-    ATB_SPEED_LOG_DEBUG("MLA decoder calculation success");
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
-atb::Status AddGetHistroyNode(
-    const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
-    std::map<std::string, uint32_t> &tensorMap)
-{
-    (void)param;
-    atb::Node getHistoryNode;
-    atb::infer::PagedCacheLoadParam pagedcacheloadparam;
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(pagedcacheloadparam, &getHistoryNode.operation));
-    getHistoryNode.inTensorIds = {
-        GetTensorIdx(tensorMap, "in_k_cache"),
-        GetTensorIdx(tensorMap, "in_k_rope_cache"),
-        GetTensorIdx(tensorMap, "in_block_tables"),
-        GetTensorIdx(tensorMap, "in_token_offset"), // translated
-        GetTensorIdx(tensorMap, "in_history_compressed_kv"),
-        GetTensorIdx(tensorMap, "in_history_k_rope"),
-    };
-    getHistoryNode.outTensorIds = {GetTensorIdxList(tensorMap, {"in_history_compressed_kv", "in_history_k_rope"})};
-    opGraph.nodes.push_back(getHistoryNode);
-    ATB_SPEED_LOG_DEBUG("Get history kv calculation success");
-    return atb::NO_ERROR;
-}
 
 template <typename NormParamType>
 atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
@@ -2333,18 +1994,32 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
                 CHECK_OPERATION_STATUS_RETURN(SetTPAllGatherNode(param, opGraph, tensorMap));
                 CHECK_OPERATION_STATUS_RETURN(SetFFNUnPadding(param, opGraph, tensorMap));
             }
+
             CHECK_OPERATION_STATUS_RETURN(AddSplitQKNode(param, opGraph, tensorMap));
             CHECK_OPERATION_STATUS_RETURN(AddLAttnQProjBNode(param, opGraph, tensorMap));
+            //latent_q - > q_lora_out
             CHECK_OPERATION_STATUS_RETURN(AddSplitQNode(param, opGraph, tensorMap));
+            //q_lora_out -> rope_q nope_q
         } else {
             CHECK_OPERATION_STATUS_RETURN(AddLAttnQProjANode(param, opGraph, tensorMap));
             CHECK_OPERATION_STATUS_RETURN(AddSplitQNode(param, opGraph, tensorMap));
             CHECK_OPERATION_STATUS_RETURN(AddLAttnKVAProjNode(param, opGraph, tensorMap));
             CHECK_OPERATION_STATUS_RETURN(AddSplitKNode(param, opGraph, tensorMap));
         }
+        if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+            CHECK_OPERATION_STATUS_RETURN(AddSfaAllGatherAndReorderCpNode(param, opGraph, tensorMap,
+                "intermediate_kv_cp", "intermediate_kv_allgather", "intermediate_kv", "cp_kv_recover_idx"));
+        }
+        // 2_0_14
         CHECK_OPERATION_STATUS_RETURN(AddLAttnKVNormNode(param, opGraph, tensorMap));
+        //intermediate_kv -> intermediate_kv
         if (param.rotaryType != RotaryType::NO_ROTARY) {
             CHECK_OPERATION_STATUS_RETURN(AddLAttnRopeNode(param, opGraph, tensorMap));
+            if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+                // CHECK_OPERATION_STATUS_RETURN(AddSfaRopeCpNode(param, opGraph, tensorMap));
+                CHECK_OPERATION_STATUS_RETURN(AddSfaAllGatherAndReorderCpNode(param, opGraph, tensorMap,
+                 "rope_k_o_cp", "rope_k_o_allgather", "rope_k_o", "cp_kv_recover_idx"));
+            }
         }
         if (param.isPrefill || !param.enableMlaPreprocess) {
             CHECK_OPERATION_STATUS_RETURN(PreprocessKV(param, opGraph, tensorMap));
@@ -2363,13 +2038,47 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
     CHECK_OPERATION_STATUS_RETURN(AddIndexerKSplitNode(param, opGraph, tensorMap));
 
     CHECK_OPERATION_STATUS_RETURN(AddIndexerQKRopeNode(param, opGraph, tensorMap));
-    CHECK_OPERATION_STATUS_RETURN(AddIndexerQKCatNode(param, opGraph, tensorMap));
 
+    CHECK_OPERATION_STATUS_RETURN(AddIndexerQKCatNode(param, opGraph, tensorMap));
+    // "intermediate_indexer_k_out"
+
+    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+        CHECK_OPERATION_STATUS_RETURN(AddSfaAllGatherAndReorderCpNode(param, opGraph, tensorMap,
+            "intermediate_indexer_k_out", "indexer_k_out_allgather", "indexer_k_out_allgather_s", "cp_kv_recover_idx"));
+    }
     CHECK_OPERATION_STATUS_RETURN(AddIndexerKReshapeAndCacheNode(param, opGraph, tensorMap));
 
     CHECK_OPERATION_STATUS_RETURN(AddIndexerWeightNode(param, opGraph, tensorMap));
 
-    CHECK_OPERATION_STATUS_RETURN(AddLightIndexerNode(param, opGraph, tensorMap));
+    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+        // q/weight rerank - "cp_load_balance_idx"
+        CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+            "intermediate_indexer_q_out", "indexer_q_out_balance", "cp_load_balance_idx"));
+        CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+            "intermediate_indexer_weight_out", "indexer_weight_out_balance", "cp_load_balance_idx"));
+        // q/weight split                         | prev / next
+        CHECK_OPERATION_STATUS_RETURN(AddSfaSplitCpNode(param, opGraph, tensorMap,
+            "indexer_q_out_balance", "indexer_q_out_prev", "indexer_q_out_next"));
+        CHECK_OPERATION_STATUS_RETURN(AddSfaSplitCpNode(param, opGraph, tensorMap,
+            "indexer_weight_out_balance", "indexer_weight_out_prev", "indexer_weight_out_next"));
+                
+        // get actual seq_len_q / seq_len_kv      | prev / next
+        //      actual_seq_lengths_query_prev / actual_seq_lengths_key_prev
+        // k rerank - "k_gather_index"            | prev / next
+        CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+            "indexer_k_out_allgather_s", "indexer_k_out_prev", "k_gather_index_prev"));
+        CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+            "indexer_k_out_allgather_s", "indexer_k_out_next", "k_gather_index_next"));
+        CHECK_OPERATION_STATUS_RETURN(AddLightIndexerCpNode(param, opGraph, tensorMap));
+            //intermediate_topk_indices_prev_cat intermediate_topk_indices_next_cat
+
+        // index & cat & rerank - "cp_o_recover_idx"
+        CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
+            "intermediate_topk_indices_draft", "intermediate_topk_indices", "cp_o_recover_idx"));
+    }
+    else{
+        CHECK_OPERATION_STATUS_RETURN(AddLightIndexerNode(param, opGraph, tensorMap));
+    }
     return atb::NO_ERROR;
 }
 
@@ -2389,8 +2098,14 @@ atb::Status SparseAttention(const LatentAttentionParam<NormParamType> &param, at
     // Preprocess
     CHECK_OPERATION_STATUS_RETURN(sparse::Preprocess(param, opGraph, tensorMap));
     // PA or MLA
-    CHECK_OPERATION_STATUS_RETURN(sparse::AddSparseFlashAttentionNode(param, opGraph, tensorMap));
-
+    
+    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+    // CP Attention
+        CHECK_OPERATION_STATUS_RETURN(sparse::AddSparseFlashAttentionCpNode(param, opGraph, tensorMap));
+    }
+    else {
+        CHECK_OPERATION_STATUS_RETURN(sparse::AddSparseFlashAttentionNode(param, opGraph, tensorMap));
+    }
     // CHECK_OPERATION_STATUS_RETURN(sparse::AddsfaTransposeNode(param, opGraph, tensorMap)); 
     // CHECK_OPERATION_STATUS_RETURN(sparse::AddReprojVNode(param, opGraph, tensorMap));
     // CHECK_OPERATION_STATUS_RETURN(sparse::AddReprojVTransposeNode(param, opGraph, tensorMap));

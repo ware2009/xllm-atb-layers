@@ -39,6 +39,8 @@ struct LmHeadParam {
     bool enableDpOut = false;
     /// Parameters passed to `LinearParallel`, see `operations/fusion/linear/linear_parallel.h` for more details.
     atb_speed::common::LinearParallelParam linearParallelParam;
+    
+    atb_speed::common::ParallelInfo contextParallelInfo;
 };
 
 /// Create an `LmHead` operation.

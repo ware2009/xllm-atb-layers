@@ -24,7 +24,7 @@ LightningIndexerOperation::~LightningIndexerOperation()
 
 uint32_t LightningIndexerOperation::GetInputNum() const
 {
-    return 6; // query, key, weight, seq_len_query, seq_len_key, block_table
+    return param_.keyLayout == "PA_BSND" ? 6 : 5; // query, key, weight, seq_len_query, seq_len_key, block_table
 }
 
 uint32_t LightningIndexerOperation::GetOutputNum() const { return 1; }
@@ -42,7 +42,14 @@ atb::Status LightningIndexerOperation::InferShape(const atb::SVector<atb::Tensor
         outTensorDesc.at(0).shape.dims[1] = inTensorDesc.at(0).shape.dims[1];
         outTensorDesc.at(0).shape.dims[2] = inTensorDesc.at(1).shape.dims[2];
         outTensorDesc.at(0).shape.dims[3] = param_.selectedCount;
-    } else {
+    }
+    else if (param_.queryLayout == "TND" && param_.keyLayout == "TND"){
+        outTensorDesc.at(0).shape.dimNum = 3;
+        outTensorDesc.at(0).shape.dims[0] = inTensorDesc.at(0).shape.dims[0];
+        outTensorDesc.at(0).shape.dims[1] = inTensorDesc.at(1).shape.dims[1];
+        outTensorDesc.at(0).shape.dims[2] = param_.selectedCount;
+    }
+    else {
         outTensorDesc.at(0).shape.dimNum = 3;
         outTensorDesc.at(0).shape.dims[0] = inTensorDesc.at(0).shape.dims[0];
         outTensorDesc.at(0).shape.dims[1] = inTensorDesc.at(1).shape.dims[2];
@@ -99,7 +106,8 @@ int LightningIndexerOperation::SetAclNNWorkspaceExecutor()
                                               aclnnVariantPack.aclInTensors.at(2)->tensor,    // weights
                                               aclnnVariantPack.aclInTensors.at(3)->tensor,    // query_seq_lengths
                                               aclnnVariantPack.aclInTensors.at(4)->tensor,    // key_seq_lengths
-                                              aclnnVariantPack.aclInTensors.at(5)->tensor,    // block_table
+                                              param_.keyLayout == "PA_BSND" ? \
+                                                aclnnVariantPack.aclInTensors.at(5)->tensor : nullptr,    // block_table
                                               const_cast<char *>(param_.queryLayout.c_str()), // query_layout
                                               const_cast<char *>(param_.keyLayout.c_str()),   // key_layout
                                               param_.selectedCount, param_.sparseMode,

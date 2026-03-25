@@ -202,11 +202,37 @@ atb::Status CreateLmHead(
     opGraph.name = "LmHead";
 
     if (param.gatherAhead) {
+        if (param.contextParallelInfo.IsEnabled()) {
+            opGraph.internalTensorNum += 1;
+            
+            atb::Node allGatherNode;
+            atb::infer::AllGatherParam allGatherParam;
+            allGatherParam.rank = param.contextParallelInfo.rank;
+            allGatherParam.rankSize = param.contextParallelInfo.rankIds.size();
+            allGatherParam.backend = param.contextParallelInfo.defaultBackend;
+            param.contextParallelInfo.InitCommDomain(allGatherParam.hcclComm, allGatherParam.commDomain);
+            CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(allGatherParam, &allGatherNode.operation));
+            allGatherNode.inTensorIds = {LmHeadTensorIdx::IN_HIDDENSTATES};
+            allGatherNode.outTensorIds = {config.INTERMEDIATE_ALLGATHER_OUT};
+            opGraph.nodes.push_back(allGatherNode);
+        }
         atb::Node gatherNode;
         atb::infer::GatherParam gatherParam;
         gatherParam.axis = param.unpadInputs ? 0 : 1;
         CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(gatherParam, &gatherNode.operation));
         gatherNode.inTensorIds = {LmHeadTensorIdx::IN_HIDDENSTATES, LmHeadTensorIdx::IN_INDICES};
+        if (param.contextParallelInfo.IsEnabled()) {
+            gatherNode.inTensorIds = {config.INTERMEDIATE_ALLGATHER_OUT, LmHeadTensorIdx::IN_INDICES};;
+            gatherNode.inTensorReshapeFuncs.resize(gatherNode.inTensorIds.size());
+            gatherNode.inTensorReshapeFuncs[0] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+                // Squeeze oldShape dim 0,1 into one dimension
+                newShape.dimNum = oldShape.dimNum - 1;
+                newShape.dims[0] = oldShape.dims[0] * oldShape.dims[1];
+                for (int i = 1; i < newShape.dimNum; ++i) {
+                    newShape.dims[i] = oldShape.dims[i + 1];
+                }
+            };
+        }
         gatherNode.outTensorIds = {config.INTERMEDIATE_GATHER_OUT};
         opGraph.nodes.push_back(gatherNode);
     }
@@ -262,6 +288,7 @@ public:
 
     enum LmHeadNoParallelTensorIdx : uint32_t {
         INTERMEDIATE_GATHER_OUT = LmHeadTensorIdx::OUT_LOGITS + 1,
+        INTERMEDIATE_ALLGATHER_OUT,
         INTERMEDIATE_SLICE_OUT  // no usage
     };
 };
@@ -275,6 +302,7 @@ public:
     enum LmHeadRowParallelTensorIdx : uint32_t {
         INTERMEDIATE_SLICE_OUT = LmHeadTensorIdx::OUT_LOGITS + 1,
         INTERMEDIATE_GATHER_OUT,
+        INTERMEDIATE_ALLGATHER_OUT,
     };
 };
 
@@ -286,6 +314,7 @@ public:
 
     enum LmHeadColumnParallelTensorIdx : uint32_t {
         INTERMEDIATE_GATHER_OUT = LmHeadTensorIdx::OUT_LOGITS + 1,
+        INTERMEDIATE_ALLGATHER_OUT,
         INTERMEDIATE_SLICE_OUT  // no usage
     };
 };

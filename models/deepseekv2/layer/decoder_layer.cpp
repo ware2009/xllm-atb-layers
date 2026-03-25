@@ -121,6 +121,14 @@ std::map<std::string, std::vector<std::string>> GetDeepseekV2LayerInTensorCandid
         }},
         {"attn_cp_prefill", {"in_seq_len_cp", "in_cp_load_balance_idx_first", "in_cp_load_balance_idx_last",
                              "in_cp_o_recover_idx", "in_cp_kv_recover_idx"}},
+        {"attn_cp_prefill_dsa", {
+            // "in_seq_len_cp",
+            // "in_cp_load_balance_idx_first", "in_cp_load_balance_idx_last",
+            "cp_o_recover_idx", "cp_kv_recover_idx", "cp_load_balance_idx",
+            "k_gather_index_prev", "k_gather_index_next",
+            "actual_seq_lengths_query_prev", "actual_seq_lengths_query_next",
+            "actual_seq_lengths_key_prev", "actual_seq_lengths_key_next"
+        }},
         {"attn_inner_sp_decode", {"in_seq_len_sp"}},
         {"force_load_balance", {
             "in_fake_topk"
@@ -257,7 +265,12 @@ std::map<std::string, uint32_t> ConstructTensorMap(
         atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "indexer_intensor", inTensorList);
     }
     if (param.mapping.Get(base::ATTN_CP).IsEnabled() && param.isPrefill) {
-        atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "attn_cp_prefill", inTensorList);
+        if (param.index_n_heads > 0) {
+            atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "attn_cp_prefill_dsa", inTensorList);
+        }
+        else {
+            atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "attn_cp_prefill", inTensorList);
+        }
     }
     if (param.mapping.Get(base::ATTN_INNER_SP).IsEnabled() && !param.isPrefill) {
         atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "attn_inner_sp_decode", inTensorList);
@@ -559,11 +572,12 @@ int64_t SetAttention(atb::GraphParam &opGraph, const DecoderLayerParam &param,
          attnInTensorNames.push_back(is_auxiliary ? "in_ffn_unpadding_idx_auxiliary" : "in_ffn_unpadding_idx");
     }
     if (param.mapping.Get(base::ATTN_CP).IsEnabled() && param.isPrefill) {
-        attnInTensorNames.push_back("in_seq_len_cp");
-        attnInTensorNames.push_back("in_cp_load_balance_idx_first");
-        attnInTensorNames.push_back("in_cp_load_balance_idx_last");
-        attnInTensorNames.push_back("in_cp_o_recover_idx");
-        attnInTensorNames.push_back("in_cp_kv_recover_idx");
+        if (param.index_n_heads > 0) {
+            atb_speed::common::AddTensorToList(GetDeepseekV2LayerInTensorCandidates(), "attn_cp_prefill_dsa", attnInTensorNames);
+        }
+        else {
+            atb_speed::common::AddTensorToList(GetDeepseekV2LayerInTensorCandidates(), "attn_cp_prefill", attnInTensorNames);
+        }
     }
     if (param.mapping.Get(base::ATTN_INNER_SP).IsEnabled() && !param.isPrefill) {
         attnInTensorNames.push_back("in_seq_len_sp");
@@ -1481,8 +1495,8 @@ atb::Status CalculateDataPartition(DecoderLayerParam &param)
     }
     // Lmhead
     param.lmheadStreamNum = 1; // Lmhead DPtranslated
-    ATB_SPEED_LOG_DEBUG("CalculateDataPartition done"
-        << ". Attention Stream Num is " << param.attnStreamNum
+    ATB_SPEED_LOG_DEBUG("CalculateDataPartition done - isDenseLayer: " << param.isDenseLayer
+        << " . Attention Stream Num is " << param.attnStreamNum
         << " . FFN Stream Num is " << param.ffnStreamNum
         << " . lmheadStreamNum Stream Num is " << param.lmheadStreamNum);
     return atb::NO_ERROR;
