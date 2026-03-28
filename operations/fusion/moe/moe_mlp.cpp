@@ -1220,10 +1220,18 @@ atb::Status CreateMoeMlpOperation(const MoeMlpParam &param, atb::Operation **ope
             outTensorDescs.at(1).shape.dims[0] = param.numOfDeviceExperts;
         }
 
-	if (param.enableInitRoutingV3 && !param.enableInitQuant && inTensorDescs.at(1).format != ACL_FORMAT_FRACTAL_NZ) {
-	  ATB_SPEED_LOG_ERROR("For non-quantized cases, enabing init_routing_v3 uses moe_grouped_matmul by default and require in_expert_weight need FRACTAL_NZ format");
-          return atb::ERROR_INVALID_TENSOR_FORMAT;
-	}
+        if (param.enableInitRoutingV3 && !param.enableInitQuant) {
+            if (inTensorDescs.at(1).format != ACL_FORMAT_FRACTAL_NZ) {
+                ATB_SPEED_LOG_ERROR("For non-quantized cases, enabing init_routing_v3 uses moe_grouped_matmul by default and require in_mlp_gateup_weight_expert FRACTAL_NZ format." <<
+                    "Disable init_routing v3 or modify coressponding loader.cpp.");
+                return atb::ERROR_INVALID_TENSOR_FORMAT;
+            }
+            if (inTensorDescs.at(7).format != ACL_FORMAT_FRACTAL_NZ) {
+                ATB_SPEED_LOG_ERROR("For non-quantized cases, enabing init_routing_v3 uses moe_grouped_matmul by default and require in_mlp_down_weight_expert FRACTAL_NZ format." << 
+                    "Disable init_routing v3 or modify coressponding loader.cpp.");
+                return atb::ERROR_INVALID_TENSOR_FORMAT;
+            }
+        }
 
         return atb::NO_ERROR;
     };

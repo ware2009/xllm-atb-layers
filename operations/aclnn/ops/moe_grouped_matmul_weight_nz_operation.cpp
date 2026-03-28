@@ -51,6 +51,10 @@ atb::Status MoeGroupedMatmulWeightNZOperation::InferShape(
     outTensorDescs.at(DIM0).shape.dims[DIM0] = inTensorDescs.at(DIM0).shape.dims[DIM0];
     outTensorDescs.at(DIM0).shape.dims[DIM1] = inTensorDescs.at(DIM1).shape.dims[nDim];
 
+    if (inTensorDescs.at(DIM1).format != ACL_FORMAT_FRACTAL_NZ) {
+        ATB_SPEED_LOG_ERROR("Customize MoeGroupedMatmulWeightNZ need a weight of format nz.");
+        return atb::ERROR_INVALID_TENSOR_FORMAT;
+    }
     ATB_SPEED_LOG_DEBUG(opName_ << "MoeGroupedMatmulWeightNZOperation infer shape end");
     return 0;
 }
