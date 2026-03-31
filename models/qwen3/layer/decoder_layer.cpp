@@ -30,8 +30,11 @@ void QwenLayerParam::PrintParam()
 {
     LayerParam::PrintParam();
     std::stringstream ss;
-    ss << " Layer Param: " << "enableLogN: " << this->enableLogN << ", isEmbedding: " << this->isEmbedding
-       << ", enableQScale: " << this->enableQScale << ", enableXattention: " << this->enableXattention;
+    ss << " Layer Param: " << "isFIA: " << this->isFIA
+       << ", enableLogN: " << this->enableLogN
+       << ", isEmbedding: " << this->isEmbedding
+       << ", enableQScale: " << this->enableQScale
+       << ", enableXattention: " << this->enableXattention;
     ATB_SPEED_LOG_DEBUG(ss.str());
 }
 
@@ -100,7 +103,7 @@ void QwenDecoderLayer::ConstructInTensorMap()
     }
 
     // translatedSplitFusetranslatedisPrefixCacheWithoutChunktranslatedTensor
-    if (param.enableSpeculate || param.enableSplitFuse || param.isPrefixCacheWithoutChunk) {
+    if (param.enableSpeculate || param.enableSplitFuse || param.isPrefixCacheWithoutChunk || param.isFIA) {
         atb_speed::common::AddTensorToList(this->inTensorCandidates, "q_len", this->inTensorList);
     }
 
@@ -149,8 +152,29 @@ void QwenDecoderLayer::SetFusionAttentionParam(
         param.enableQScale ? 1.0 : fusionAttentionParam.pageAttentionParam.qkScale;
     fusionAttentionParam.selfAttentionParam.qkScale =
         param.enableQScale ? 1.0 : fusionAttentionParam.selfAttentionParam.qkScale;
+    fusionAttentionParam.isFIA = param.isFIA;
+    fusionAttentionParam.bs = param.bs;
     fusionAttentionParam.enableAclnnRmsNorm = param.enableAclnnRmsNorm;
     fusionAttentionParam.isPrefixCacheWithoutChunk = param.isPrefixCacheWithoutChunk;
+    if (param.isFIA) {
+        fusionAttentionParam.aclnnFusedInferAttnParam.needMask = true;
+        fusionAttentionParam.aclnnFusedInferAttnParam.enablePa = true;
+        fusionAttentionParam.aclnnFusedInferAttnParam.numHeads =
+            param.numAttentionHeadsPerRank;
+        fusionAttentionParam.aclnnFusedInferAttnParam.numKeyValueHeads =
+            param.numKeyValueHeadsPerRank;
+        fusionAttentionParam.aclnnFusedInferAttnParam.inputLayout =
+            param.FIAinputLayout;
+        if (fusionAttentionParam.aclnnFusedInferAttnParam.enablePa) {
+            fusionAttentionParam.aclnnFusedInferAttnParam.inputLayout = "TND";
+        }
+        fusionAttentionParam.aclnnFusedInferAttnParam.sparseMode = 3;
+        fusionAttentionParam.aclnnFusedInferAttnParam.innerPrecise = 1;
+        fusionAttentionParam.aclnnFusedInferAttnParam.blockSize =
+            param.blockSize;
+        fusionAttentionParam.aclnnFusedInferAttnParam.scaleValue =
+            1.0 / sqrt(param.hiddenSizePerAttentionHead);
+    }
     if (fusionAttentionParam.isPrefixCacheWithoutChunk) {
         fusionAttentionParam.selfAttentionParam.maskType = atb::infer::SelfAttentionParam::MaskType::MASK_TYPE_NORM_COMPRESS;
     }
@@ -211,7 +235,7 @@ std::map<unsigned int, std::vector<std::string>> QwenDecoderLayer::GetAttentionI
         attnInTensor[common::AttnInTensorCategory::ATTN_OMNI] = \
             this->inTensorCandidates["compress_head_rope"];
     }
-    if (this->param.enableSpeculate || param.enableSplitFuse || param.isPrefixCacheWithoutChunk) {
+    if (this->param.enableSpeculate || param.enableSplitFuse || param.isPrefixCacheWithoutChunk || param.isFIA) {
         attnInTensor[common::AttnInTensorCategory::ATTN_SPECULATE] = this->inTensorCandidates["q_len"];
     }
     if (this->param.enableKvQuant) {

@@ -102,7 +102,7 @@ std::map<std::string, uint32_t> QwenMoeConstructTensorMap(
     atb_speed::common::AddTensorToList(qwenMoeLayerInTensorCandidates, "default_weight", inTensorList);
     atb_speed::common::AddTensorToList(qwenMoeLayerInTensorCandidates, "default", inTensorList);
 
-    if (param.enableSpeculate || param.enableSplitFuse) {
+    if (param.enableSpeculate || param.enableSplitFuse || param.isFIA) {
         atb_speed::common::AddTensorToList(qwenMoeLayerInTensorCandidates, "q_len", inTensorList);
     }
     if (param.enableAclGraphPagedAttention && !param.isPrefill) {
@@ -167,6 +167,27 @@ atb::Status SetFusionAttentionParam(
     fusionAttentionParam.enableAclGraphPagedAttention = param.enableAclGraphPagedAttention;
     fusionAttentionParam.enableAddNorm = param.enableAclnnExternelAddRmsNorm;
     fusionAttentionParam.matmulBackend = atb_speed::common::OpBackend::ACLNN;
+    fusionAttentionParam.isFIA = param.isFIA;
+    fusionAttentionParam.bs = param.bs;
+    if (param.isFIA) {
+        fusionAttentionParam.aclnnFusedInferAttnParam.needMask = true;
+        fusionAttentionParam.aclnnFusedInferAttnParam.enablePa = true;
+        fusionAttentionParam.aclnnFusedInferAttnParam.numHeads =
+            param.numAttentionHeadsPerRank;
+        fusionAttentionParam.aclnnFusedInferAttnParam.numKeyValueHeads =
+            param.numKeyValueHeadsPerRank;
+        fusionAttentionParam.aclnnFusedInferAttnParam.inputLayout =
+            param.FIAinputLayout;
+        if (fusionAttentionParam.aclnnFusedInferAttnParam.enablePa) {
+            fusionAttentionParam.aclnnFusedInferAttnParam.inputLayout = "TND";
+        }
+        fusionAttentionParam.aclnnFusedInferAttnParam.sparseMode = 3;
+        fusionAttentionParam.aclnnFusedInferAttnParam.innerPrecise = 1;
+        fusionAttentionParam.aclnnFusedInferAttnParam.blockSize =
+            param.blockSize;
+        fusionAttentionParam.aclnnFusedInferAttnParam.scaleValue =
+            1.0 / sqrt(param.hiddenSizePerAttentionHead);
+    }
     return atb::NO_ERROR;
 }
 
@@ -234,7 +255,7 @@ atb::Status SetFusionAttentionNode(const MoeDecoderLayerParam &param, atb::Graph
         attnInTensorNames.push_back("quant_add_norm_scaling");
         attnInTensorNames.push_back("quant_add_norm_offset");
     }
-    if (param.enableSpeculate || param.enableSplitFuse) {
+    if (param.enableSpeculate || param.enableSplitFuse || param.isFIA) {
         attnInTensorNames.push_back("in_q_len");
     }
     if (fusionAttentionParam.useQKNorm) {

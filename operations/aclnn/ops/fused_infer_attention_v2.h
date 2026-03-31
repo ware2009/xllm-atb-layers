@@ -49,6 +49,10 @@ struct AclNNFusedInferAttnParam {
     /// 2: high precision mode with correction
     /// 3: high performance mode with correction
     int64_t innerPrecise = 0;
+
+    bool enablePa = false;
+    int64_t blockSize = 0;
+    
     std::string ToString() const
     {
         std::ostringstream oss;

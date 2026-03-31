@@ -86,6 +86,88 @@ int64_t AddSelfAttention(
 }
 
 template <typename NormParamType>
+int64_t AddFIA(
+    atb::GraphParam& opGraph, const FusionAttentionParam<NormParamType>& param,
+    std::map<std::string, uint32_t>& tensorMap)
+{
+    if (!param.enableRopeQuantKvcache && param.needUpdateKVCache && !param.isFA) {
+        if (!param.enableXattention) {
+            CHECK_OPERATION_STATUS_RETURN(AddPaKVCacheOperation(opGraph, param, tensorMap));
+        }
+    }
+
+    atb::Node fiaNode;
+    fiaNode.operation = new atb_speed::common::FusedInferAttentionV2Operation(
+        "FusedInferAttentionNode", param.aclnnFusedInferAttnParam);
+    if (param.aclnnFusedInferAttnParam.enablePa){  // if pa
+        fiaNode.inTensorIds = {
+            GetTensorIdx(tensorMap, param.aclnnFusedInferAttnParam.inputLayout == "BSND" ? \
+                "intermediate_q_bsnd" : "intermediate_q"),
+            GetTensorIdx(tensorMap, "in_k_cache"),
+            GetTensorIdx(tensorMap, "in_v_cache"),
+            GetTensorIdx(tensorMap, "in_seq_len"),
+            GetTensorIdx(tensorMap, "in_attention_mask"),
+        };
+        fiaNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "in_q_len"));
+        fiaNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "in_block_tables"));
+    }
+    else {
+        fiaNode.inTensorIds = {
+            GetTensorIdx(tensorMap, "intermediate_q"),
+            GetTensorIdx(tensorMap, "intermediate_k"),
+            GetTensorIdx(tensorMap, "intermediate_v"),
+            GetTensorIdx(tensorMap, "in_seq_len"),
+            GetTensorIdx(tensorMap, "in_attention_mask"),
+        };
+        if (tensorMap, param.aclnnFusedInferAttnParam.inputLayout == "TND" ) {
+            fiaNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "in_q_len"));
+        }
+    }
+    
+    fiaNode.inTensorReshapeFuncs.resize(fiaNode.inTensorIds.size());
+    auto reshapeToBSNDFunc = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+        if (oldShape.dimNum == 3) {
+            size_t dim = 0;
+            int batchSize = *param.bs;
+            if (batchSize <= 0) {
+                batchSize = 1;
+            }
+            newShape.dims[dim++] = batchSize;
+            newShape.dims[dim++] = oldShape.dims[0] / batchSize;
+            newShape.dims[dim++] = oldShape.dims[1];
+            newShape.dims[dim++] = oldShape.dims[2];
+            newShape.dimNum = dim;
+        }
+        else {
+            newShape = oldShape;
+        }
+    };
+    auto reshapeToBnBsHFunc = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+        if (oldShape.dimNum == 4) {
+            newShape.dimNum = 3;
+            newShape.dims[0] = oldShape.dims[0];
+            newShape.dims[1] = oldShape.dims[1];
+            newShape.dims[2] = oldShape.dims[2] * oldShape.dims[3];
+        }
+        else {
+            newShape = oldShape;
+        }
+    };
+    if (tensorMap, param.aclnnFusedInferAttnParam.inputLayout == "BSND" ){
+        fiaNode.inTensorReshapeFuncs.at(0) = reshapeToBSNDFunc;
+    }
+    if (param.aclnnFusedInferAttnParam.enablePa){  // kvcache to BnBsH
+        fiaNode.inTensorReshapeFuncs.at(1) = reshapeToBnBsHFunc;
+        fiaNode.inTensorReshapeFuncs.at(2) = reshapeToBnBsHFunc;
+    }
+    fiaNode.outTensorIds = {
+        GetTensorIdx(tensorMap, param.aclnnFusedInferAttnParam.inputLayout == "BSND" ? \
+            "intermediate_self_attention_bsnd" : "intermediate_self_attention")};
+    opGraph.nodes.push_back(fiaNode);
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
 int64_t AddFaKVCacheOperation(
     atb::GraphParam& opGraph, const FusionAttentionParam<NormParamType>& param,
     std::map<std::string, uint32_t>& tensorMap)
@@ -456,6 +538,9 @@ template int64_t AddPaKVCacheOperation(
 template int64_t AddSelfAttention(
     atb::GraphParam& opGraph, const FusionAttentionParam<atb::infer::RmsNormParam>& param,
     std::map<std::string, uint32_t>& tensorMap);
+template int64_t AddFIA(
+    atb::GraphParam& opGraph, const FusionAttentionParam<atb::infer::RmsNormParam>& param,
+    std::map<std::string, uint32_t>& tensorMap);
 template int64_t ConstructFaNode(
     atb::Node& selfAttentionNode, const FusionAttentionParam<atb::infer::RmsNormParam>& param,
     std::map<std::string, uint32_t>& tensorMap);
@@ -476,6 +561,9 @@ template int64_t AddPaKVCacheOperation(
     atb::GraphParam& opGraph, const FusionAttentionParam<atb::infer::LayerNormParam>& param,
     std::map<std::string, uint32_t>& tensorMap);
 template int64_t AddSelfAttention(
+    atb::GraphParam& opGraph, const FusionAttentionParam<atb::infer::LayerNormParam>& param,
+    std::map<std::string, uint32_t>& tensorMap);
+template int64_t AddFIA(
     atb::GraphParam& opGraph, const FusionAttentionParam<atb::infer::LayerNormParam>& param,
     std::map<std::string, uint32_t>& tensorMap);
 template int64_t ConstructFaNode(

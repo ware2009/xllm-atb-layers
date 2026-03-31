@@ -280,6 +280,7 @@ std::map<std::string, std::vector<std::string>> GetAttnInTensorCandidates()
         },
         {"acl_graph", {"paged_attention_tiling_data"}},
         {"x_attention", {"in_decode_k_cache", "in_decode_v_cache", "in_beam_width", "in_current_round"}},
+        {"fia", {"fia_padding_idx", "fia_unpadding_idx"}},
     };
     return attnInTensorCandidates;
 }
@@ -298,6 +299,12 @@ std::map<std::string, std::vector<std::string>> GetAttnIntermediateTensorCandida
         },
         {"dequant_rope",
             {"intermediate_qkv_rope"}
+        },
+        {"fia",
+            {
+                "intermediate_q_bsnd", 
+                "intermediate_self_attention_bsnd"
+            }
         }
     };
     return attnIntermediateTensorCandidates;
@@ -317,6 +324,12 @@ std::map<std::string, std::vector<std::string>> GetAttnIntermediateTensorCandida
         },
         {"dequant_rope",
             {"intermediate_qkv_rope"}
+        },
+        {"fia", 
+            {
+                "intermediate_q_bsnd", 
+                "intermediate_self_attention_bsnd"
+            }
         }
     };
     return attnIntermediateTensorCandidates;
@@ -376,6 +389,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(
     if (param.enableAddNorm) {
         AddTensorToList(attnInTensorCandidates, "add_rmsnorm_quant", inTensorList);
     }
+    if (param.isPrefill && param.isFIA && param.aclnnFusedInferAttnParam.inputLayout == "BSND") {
+        AddTensorToList(attnInTensorCandidates, "fia", inTensorList);
+    }
     AddTensorToList(attnIntermediateTensorCandidates, "default", intermediateTensorList);
 
     // translatedMask AlibitranslatedTensor
@@ -395,7 +411,8 @@ std::map<std::string, uint32_t> ConstructTensorMap(
         AddTensorToList(attnInTensorCandidates, "compress_head_rope", inTensorList);
     }
     // translatedTensor
-    if (param.pageAttentionParam.calcType == atb::infer::PagedAttentionParam::CalcType::CALC_TYPE_SPEC || param.isPrefixCacheWithoutChunk) {
+    if (param.pageAttentionParam.calcType == atb::infer::PagedAttentionParam::CalcType::CALC_TYPE_SPEC \
+        || param.isPrefixCacheWithoutChunk || param.isFIA) {
         AddTensorToList(attnInTensorCandidates, "speculate", inTensorList);
     }
 
@@ -455,6 +472,10 @@ std::map<std::string, uint32_t> ConstructTensorMap(
 
     if (!param.isPrefill && param.enableAclGraphPagedAttention) {
         AddTensorToList(attnInTensorCandidates, "acl_graph", inTensorList);
+    }
+
+    if (param.isPrefill && param.isFIA && param.aclnnFusedInferAttnParam.inputLayout == "BSND") {
+        AddTensorToList(attnIntermediateTensorCandidates, "fia", intermediateTensorList);
     }
 
     inTensorNum = inTensorList.size();
@@ -721,6 +742,42 @@ atb::Status AddQKVQuantNode(const FusionAttentionParam<NormParamType> &param, at
 }
 
 template <typename NormParamType>
+atb::Status AddPadNode(atb::GraphParam &opGraph,
+    const FusionAttentionParam<NormParamType> & /*param*/,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    atb::infer::GatherParam padParam;
+    atb::Node padqNode;
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(padParam, &padqNode.operation));
+    padqNode.inTensorIds = atb_speed::common::GetTensorIdxList(
+        tensorMap, { "intermediate_q", "fia_padding_idx"} );
+    padqNode.outTensorIds = atb_speed::common::GetTensorIdxList(
+        tensorMap, { "intermediate_q_bsnd" });
+    opGraph.nodes.push_back(padqNode);
+
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddUnpadNode(atb::GraphParam &opGraph,
+    const FusionAttentionParam<NormParamType> & /*param*/,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    atb::infer::GatherParam unpadParam;
+    atb::Node unpadNode;
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(unpadParam, &unpadNode.operation));
+    unpadNode.inTensorIds = atb_speed::common::GetTensorIdxList(
+        tensorMap, { "intermediate_self_attention_bsnd", "fia_unpadding_idx"} );
+    unpadNode.inTensorReshapeFuncs.resize(unpadNode.inTensorIds.size());
+    unpadNode.inTensorReshapeFuncs.at(0) = &SqueezeBatchAndHiddenSize;
+    unpadNode.outTensorIds = atb_speed::common::GetTensorIdxList(
+        tensorMap, { "intermediate_self_attention" });
+    opGraph.nodes.push_back(unpadNode);
+    return atb::NO_ERROR;
+}
+
+
+template <typename NormParamType>
 atb::Status AddSelfOutLinearParallelNode(const FusionAttentionParam<NormParamType> &param,
     atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
 {
@@ -778,7 +835,11 @@ atb::Status AddSelfOutLinearParallelNode(const FusionAttentionParam<NormParamTyp
         denseInTensorNames.push_back("fake_rs_shape");
     }
     selfOutLinearParallelNode.inTensorIds = GetTensorIdxList(tensorMap, denseInTensorNames);
-    if (!param.isFA) {
+    if (param.isFIA) {
+        selfOutLinearParallelNode.inTensorReshapeFuncs.resize(selfOutLinearParallelNode.inTensorIds.size());
+        selfOutLinearParallelNode.inTensorReshapeFuncs.at(0) = param.aclnnFusedInferAttnParam.inputLayout == "BSND" ? \
+            &SqueezeBatchAndHiddenSize : &SqueezeHeadNumHeadDim;
+    } else if (!param.isFA) {
         selfOutLinearParallelNode.inTensorReshapeFuncs.resize(selfOutLinearParallelNode.inTensorIds.size());
         selfOutLinearParallelNode.inTensorReshapeFuncs.at(0) = &SqueezeHeadNumHeadDim;
     }
@@ -1162,7 +1223,17 @@ atb::Status Attention(const FusionAttentionParam<NormParamType> &param, atb::Ope
     }
 
     // SelfAttention Node
-    CHECK_OPERATION_STATUS_RETURN(AddSelfAttention(opGraph, param, tensorMap));
+    if (param.isFIA) {
+        if (param.aclnnFusedInferAttnParam.inputLayout == "BSND") {
+            CHECK_OPERATION_STATUS_RETURN(AddPadNode(opGraph, param, tensorMap));
+        }
+        CHECK_OPERATION_STATUS_RETURN(AddFIA(opGraph, param, tensorMap));
+        if (param.aclnnFusedInferAttnParam.inputLayout == "BSND") {
+            CHECK_OPERATION_STATUS_RETURN(AddUnpadNode(opGraph, param, tensorMap));
+        }
+    } else {
+        CHECK_OPERATION_STATUS_RETURN(AddSelfAttention(opGraph, param, tensorMap));
+    }
 
     // Dense Node
     CHECK_OPERATION_STATUS_RETURN(AddSelfOutLinearParallelNode(param, opGraph, tensorMap));

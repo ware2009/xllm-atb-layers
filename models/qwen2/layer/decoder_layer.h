@@ -16,6 +16,8 @@
 #ifndef ATB_SPEED_MODELS_QWEN_DECODER_LAYER_H
 #define ATB_SPEED_MODELS_QWEN_DECODER_LAYER_H
 
+#include <cstdint>
+#include <memory>
 #include <vector>
 #include "nlohmann/json.hpp"
 
@@ -26,6 +28,9 @@ namespace atb_speed {
 namespace qwen {
 struct DecoderLayerParam {
     bool isFA = false;
+    bool isFIA = false;
+    std::string FIAinputLayout = "TND";
+    int64_t blockSize = 128;
     bool isPrefill = false;
     bool isBF16 = false;
     bool isPack = true;
@@ -55,6 +60,7 @@ struct DecoderLayerParam {
     // translated,translatedq,k,v,self attention out,gate,up,down lineartranslated
     std::vector<int> linearQuantType = {};
     std::vector<int> linearTransposeType;
+    std::shared_ptr<int> bs = std::make_shared<int>(0);
 };
 
 

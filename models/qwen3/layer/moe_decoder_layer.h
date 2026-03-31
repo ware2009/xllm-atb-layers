@@ -16,6 +16,9 @@
 #ifndef ATB_SPEED_MODELS_QWEN_MOE_DECODER_LAYER_H
 #define ATB_SPEED_MODELS_QWEN_MOE_DECODER_LAYER_H
 
+#include <cstdint>
+#include <memory>
+
 #include <vector>
 #include "nlohmann/json.hpp"
 
@@ -28,6 +31,9 @@ namespace atb_speed {
 namespace qwen {
 class MoeDecoderLayerParam : public atb_speed::moe::MoeLayerParam {
 public:
+    bool isFIA = false;
+    std::string FIAinputLayout = "TND";
+    int64_t blockSize = 128;
     bool isPack = true;
     int quantType = 0;
     int maskStartIdx = 0;
@@ -49,6 +55,7 @@ public:
     bool enableAclnnAddRmsNorm = false;
     bool enableAclnnExternelAddRmsNorm = false;
     bool enableFusedReducesumDiv = false;
+    std::shared_ptr<int> bs = std::make_shared<int>(0);
 };
 
 atb::Status MoeDecoderLayer(const MoeDecoderLayerParam &param, atb::Operation **operation);

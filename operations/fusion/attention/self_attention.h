@@ -112,6 +112,11 @@ int64_t AddSelfAttention(
     atb::GraphParam &opGraph, const FusionAttentionParam<NormParamType> &param,
     std::map<std::string, uint32_t> &tensorMap);
     
+template <typename NormParamType>
+int64_t AddFIA(
+    atb::GraphParam &opGraph, const FusionAttentionParam<NormParamType> &param,
+    std::map<std::string, uint32_t> &tensorMap);
+    
 } // namespace common
 } // namespace atb_speed
 #endif

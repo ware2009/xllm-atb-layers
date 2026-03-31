@@ -65,6 +65,7 @@ std::map<std::string, std::vector<std::string>> GetQwenLayerInTensorCandidates()
             "in_hidden_states",  // shape: FA: [batchSize, seqLen, hiddenSize] PA: [seqLen, hiddenSize]
             "in_cos_embedding", "in_sin_embedding", "in_attention_mask", "in_k_cache", "in_v_cache", "in_seq_len",
             "in_token_offset", "in_layer_id", "in_block_tables", "in_slots"}},
+        {"fia", {"in_fia_padding_idx", "in_fia_unpadding_idx"}},
         {"q_len", {"in_q_len"}},
         {"logn_enable", {"kv_cache_idx"}},
         {"lora_common", {"in_seq_len_cum_sum"}},
@@ -111,8 +112,12 @@ std::map<std::string, uint32_t> ConstructTensorMap(
     atb_speed::common::AddTensorToList(
         qwenLayerIntermediateTensorCandiadates, "default", intermediateTensorList);
 
+    if (param.isFIA) {
+        atb_speed::common::AddTensorToList(qwenLayerInTensorCandiadates, "fia", inTensorList);
+    }
+
     // translatedSplitFusetranslatedTensor
-    if (param.supportSpeculate || param.enableSplitFuse) {
+    if (param.supportSpeculate || param.enableSplitFuse || param.isFIA) {
         atb_speed::common::AddTensorToList(qwenLayerInTensorCandiadates, "q_len", inTensorList);
     }
 
@@ -175,9 +180,11 @@ void SetFusionAttentionParam(
 {
     SetFusionAttentionParamPart(fusionAttentionParam, param);
     fusionAttentionParam.isFA = param.isFA;
+    fusionAttentionParam.isFIA = param.isFIA;
     fusionAttentionParam.isPrefill = param.isPrefill;
     fusionAttentionParam.enableSplitFuse = param.enableSplitFuse;
     fusionAttentionParam.headDim = param.hiddenSizePerAttentionHead;
+    fusionAttentionParam.bs = param.bs;
     fusionAttentionParam.selfAttentionParam.headNum = param.numAttentionHeadsPerRank;
     fusionAttentionParam.selfAttentionParam.kvHeadNum = param.numKeyValueHeadsPerRank;
     if (param.hiddenSizePerAttentionHead == 0) {
@@ -186,6 +193,24 @@ void SetFusionAttentionParam(
         throw std::runtime_error(ss.str());
     }
     fusionAttentionParam.selfAttentionParam.qkScale = 1.0 / sqrt(param.hiddenSizePerAttentionHead);
+
+    if (param.isFIA) {
+        fusionAttentionParam.aclnnFusedInferAttnParam.needMask = true;
+        
+        fusionAttentionParam.aclnnFusedInferAttnParam.enablePa = true;
+        fusionAttentionParam.aclnnFusedInferAttnParam.numHeads = param.numAttentionHeadsPerRank;
+        fusionAttentionParam.aclnnFusedInferAttnParam.numKeyValueHeads =
+            param.numKeyValueHeadsPerRank;
+        fusionAttentionParam.aclnnFusedInferAttnParam.inputLayout = param.FIAinputLayout;
+        if (fusionAttentionParam.aclnnFusedInferAttnParam.enablePa) {
+            fusionAttentionParam.aclnnFusedInferAttnParam.inputLayout = "TND";
+        }
+        fusionAttentionParam.aclnnFusedInferAttnParam.sparseMode = 3;
+        fusionAttentionParam.aclnnFusedInferAttnParam.innerPrecise = 1;
+        fusionAttentionParam.aclnnFusedInferAttnParam.blockSize = param.blockSize;
+        
+        fusionAttentionParam.aclnnFusedInferAttnParam.scaleValue = 1.0 / sqrt(param.hiddenSizePerAttentionHead);
+    }
     fusionAttentionParam.selfAttentionParam.isTriuMask = param.isPrefill ? 1 : 0;
     if (param.isFA) {
         fusionAttentionParam.selfAttentionParam.calcType = param.isPrefill ?
@@ -238,7 +263,11 @@ int64_t AddFusionAttention(atb::Node &attentionNode, const DecoderLayerParam &pa
         "in_qkv_dense_weight", "in_qkv_dense_scale", "in_qkv_dense_offset", "in_qkv_dense_descale",
         "in_qkv_dense_bias", "in_qkv_dense_compress_idx"
     };
-    if (param.supportSpeculate || param.enableSplitFuse) {
+    if (param.isFIA) {
+        attnInTensorNames.push_back("in_fia_padding_idx");
+        attnInTensorNames.push_back("in_fia_unpadding_idx");
+    }
+    if (param.supportSpeculate || param.enableSplitFuse || param.isFIA) {
         attnInTensorNames.push_back("in_q_len");
     }
     auto qwenLayerInTensorCandiadates = GetQwenLayerInTensorCandidates();

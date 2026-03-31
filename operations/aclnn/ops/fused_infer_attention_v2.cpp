@@ -15,6 +15,7 @@
  */
 #include "fused_infer_attention_v2.h"
 
+#include <algorithm>
 #include <securec.h>
 
 #include "acl/acl.h"
@@ -25,8 +26,9 @@
 namespace atb_speed {
 namespace common {
 
-const int ACLNN_TENSOR_LIST_INDEX[8] = {-1, 1, 2, -1, -1, -1, -1, -1};
-const int ACLNN_TENSOR_INDEX[8] = {0, 0, 0, 4, 6, 14, 12, 13};
+const int ACLNN_TENSOR_INDEX[NUM7] = {0, 0, 0, 6, 4, 5, 14};
+const int ACLNN_TENSOR_LIST_INDEX[NUM7] = {-1, 1, 2, -1, -1, -1, -1};
+
 FusedInferAttentionV2Operation::FusedInferAttentionV2Operation(
     const std::string& name,
     const AclNNFusedInferAttnParam& param)
@@ -39,7 +41,19 @@ FusedInferAttentionV2Operation::~FusedInferAttentionV2Operation() {
   ATB_SPEED_LOG_DEBUG("~FusedInferAttentionV2Operation");
 }
 
-uint32_t FusedInferAttentionV2Operation::GetInputNum() const { return NUM4; }
+uint32_t FusedInferAttentionV2Operation::GetInputNum() const {
+  auto input_num = NUM4;
+  if (param_.needMask) {
+    input_num += NUM1;  //mask
+    if (param_.enablePa) {
+      input_num += NUM2;  //q_seq_len, block_table
+    }
+    else if (param_.inputLayout == "TND") {
+      input_num += NUM1;  //q_seq_len
+    }
+  }
+  return input_num;
+}
 
 uint32_t FusedInferAttentionV2Operation::GetOutputNum() const { return NUM1; }
 
@@ -83,10 +97,7 @@ int FusedInferAttentionV2Operation::CreateAclNNInTensorVariantPack(
     aclnnTensor->atbTensor = variantPack.inTensors.at(i);
     aclnnTensor->tensorIdx = ACLNN_TENSOR_INDEX[i];
     aclnnTensor->tensorListidx = ACLNN_TENSOR_LIST_INDEX[i];
-    if (i == 4) {  // qSeqLens is 2nd last input tensor
-      aclnnTensor->needUpdateTensorDataPtr = false;
-      ConvertTensorToSeqLengths(aclnnTensor->atbTensor, actualSeqLengths_);
-    } else if (i == 3) {  // kvSeqLens is the last input tensor
+    if (i == 3) {  // seqLen tensor
       aclnnTensor->needUpdateTensorDataPtr = false;
       aclnnTensor->intArrayHostData.dataSize = aclnnTensor->atbTensor.dataSize / NUM4; // int32 has 4 bytes
       aclnnTensor->intArrayHostData.data.resize(aclnnTensor->intArrayHostData.dataSize);
@@ -105,6 +116,25 @@ int FusedInferAttentionV2Operation::CreateAclNNInTensorVariantPack(
           static_cast<int64_t *>(aclnnTensor->intArrayHostData.data.data()),
           aclnnTensor->intArrayHostData.dataSize);
       actualSeqLengthsKv_ = aclnnTensor->intArrayHostData.intArray;
+    } else if (i == 5) {  // q_seqLen tensor
+      aclnnTensor->needUpdateTensorDataPtr = false;
+      aclnnTensor->intArrayHostData.dataSize = aclnnTensor->atbTensor.dataSize / NUM4; // int32 has 4 bytes
+      aclnnTensor->intArrayHostData.data.resize(aclnnTensor->intArrayHostData.dataSize);
+      aclnnTensor->intArrayHostData.dataOri.resize(aclnnTensor->intArrayHostData.dataSize);
+      std::transform(
+          static_cast<int32_t *>(aclnnTensor->atbTensor.hostData),
+          static_cast<int32_t *>(aclnnTensor->atbTensor.hostData) + aclnnTensor->atbTensor.dataSize / NUM4,
+          aclnnTensor->intArrayHostData.data.data(), [](int32_t value) {
+              return static_cast<int64_t>(value);
+      });
+      std::copy(static_cast<int32_t *>(aclnnTensor->atbTensor.hostData),
+          static_cast<int32_t *>(aclnnTensor->atbTensor.hostData) +
+              aclnnTensor->atbTensor.dataSize / sizeof(int32_t),
+          aclnnTensor->intArrayHostData.dataOri.data());
+      aclnnTensor->intArrayHostData.intArray = aclCreateIntArray(
+          static_cast<int64_t *>(aclnnTensor->intArrayHostData.data.data()),
+          aclnnTensor->intArrayHostData.dataSize);
+      actualSeqLengths_ = aclnnTensor->intArrayHostData.intArray;
     } else {
       aclnnTensor->needUpdateTensorDataPtr = true;
       atb::Tensor atbTensor = variantPack.inTensors.at(i);
@@ -132,7 +162,6 @@ int FusedInferAttentionV2Operation::CreateAclNNInTensorVariantPack(
   std::vector<aclTensor *> valueList{value};
   auto tensorKeyList = aclCreateTensorList(keyList.data(), keyList.size());
   auto tensorValueList = aclCreateTensorList(valueList.data(), valueList.size());
-  aclnnVariantPack.aclInTensorList.resize(3);
   aclnnVariantPack.aclInTensorList.clear();
   aclnnVariantPack.aclInTensorList.push_back(nullptr);
   aclnnVariantPack.aclInTensorList.push_back(tensorKeyList);
@@ -149,8 +178,7 @@ int FusedInferAttentionV2Operation::CreateAclNNOutTensorVariantPack(
     aclnnTensor->tensorIdx = i;
     aclnnTensor->needUpdateTensorDataPtr = true;
     aclnnTensor->atbTensor = variantPack.outTensors.at(i);
-    atb::Tensor squeezedAtbTensor =
-        SqueezeBatchSeq(variantPack.outTensors.at(i));
+    atb::Tensor squeezedAtbTensor = variantPack.outTensors.at(i);
     aclnnTensor->strides = GetCopyTensorStride(squeezedAtbTensor.desc.shape);
     aclnnTensor->tensor = aclCreateTensor(squeezedAtbTensor.desc.shape.dims,
                                           squeezedAtbTensor.desc.shape.dimNum,
@@ -176,22 +204,26 @@ int FusedInferAttentionV2Operation::SetAclNNWorkspaceExecutor() {
                       << "FusedInferAttentionV2Operation GetWorkspace Start!");
   AclNNVariantPack& aclnnVariantPack = this->aclnnOpCache_->aclnnVariantPack;
   aclTensor* query = aclnnVariantPack.aclInTensors.at(0)->tensor;
+  aclTensor* attenMask =
+      param_.needMask ? aclnnVariantPack.aclInTensors.at(4)->tensor : nullptr;
+  aclTensor* blocktable = 
+      param_.enablePa ? aclnnVariantPack.aclInTensors.at(6)->tensor : nullptr;
   aclTensor* attnOut = aclnnVariantPack.aclOutTensors.at(0)->tensor;
   int ret = aclnnFusedInferAttentionScoreV2GetWorkspaceSize(
         query,        // 0: query index
         aclnnVariantPack.aclInTensorList.at(1),             // 1: key cache index
         aclnnVariantPack.aclInTensorList.at(2),             // 2: value cache index
-        nullptr, nullptr,                    // 4: attenMask
+        nullptr, attenMask,                 // 4: attenMask
         actualSeqLengths_, actualSeqLengthsKv_, // 6: seq length index
         nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr,                   // 12: antiquantScale
         nullptr,                  // 13: antiquantOffset
-        nullptr,                            // 14: blocktable
+        blocktable,                            // 14: blocktable
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         param_.numHeads, param_.scaleValue, param_.preTokens, param_.nextTokens,
         const_cast<char*>(param_.inputLayout.c_str()),
         param_.numKeyValueHeads, param_.sparseMode, param_.innerPrecise,
-        0, 0, false, 0, 0,
+        param_.blockSize, 0, false, 0, 0,
         attnOut,      // 0: out tensor
         nullptr, &this->aclnnOpCache_->workspaceSize, &this->aclnnOpCache_->aclExecutor);
   if (ret != 0) {

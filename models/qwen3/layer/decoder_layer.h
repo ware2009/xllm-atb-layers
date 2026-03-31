@@ -16,6 +16,9 @@
 #ifndef ATB_SPEED_MODELS_QWEN3_DECODER_LAYER_H
 #define ATB_SPEED_MODELS_QWEN3_DECODER_LAYER_H
 
+#include <cstdint>
+#include <memory>
+
 #include "models/base/layer/decoder_layer.h"
 #include "models/base/param/layer_param.h"
 
@@ -26,6 +29,9 @@ class QwenLayerParam : public atb_speed::base::LayerParam {
 public:
     void PrintParam() override;
 
+    bool isFIA = false;
+    std::string FIAinputLayout = "TND";
+    int64_t blockSize = 128;
     bool enableLogN = false;
     bool isEmbedding = false;
     bool enableQScale = false;
@@ -35,6 +41,7 @@ public:
     bool isPrefixCacheWithoutChunk = false;
     // enable end-to-end decode kv cache pipeline (prefill + decode)
     bool enableXattention = false;
+    std::shared_ptr<int> bs = std::make_shared<int>(0);
 };
 
 class QwenDecoderLayer : public atb_speed::base::DecoderLayer<atb::infer::RmsNormParam> {

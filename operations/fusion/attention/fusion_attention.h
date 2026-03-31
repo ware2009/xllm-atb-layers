@@ -158,6 +158,8 @@ struct FusionAttentionParam {
     bool enableSplitFuse = false;
     /// If `isFA` is true, Flash Attention is used; otherwise, Paged Attention is used
     bool isFA = true;
+    /// If `isFIA` is true, the prefill attention uses the fused infer attention path.
+    bool isFIA = false;
     /// A flag indicating the prefill and decode phases
     bool isPrefill = false;
     /// The dimension per attention head
