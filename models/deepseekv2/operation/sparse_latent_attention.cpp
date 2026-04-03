@@ -151,6 +151,7 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
             "indexer_k_out_prev", "indexer_k_out_next",
             "intermediate_topk_indices_prev_cat", "intermediate_topk_indices_next_cat",
             "intermediate_topk_indices_balance", "intermediate_topk_indices_prev", "intermediate_topk_indices_next",
+            "intermediate_topk_indices_balance_i64", "intermediate_topk_indices_prev_i64", "intermediate_topk_indices_next_i64",
             "intermediate_topk_indices_draft",
             "intermediate_q_balance", "intermediate_q_prev", "intermediate_q_next",
             "rope_q_o_balance", "rope_q_o_prev", "rope_q_o_next",
@@ -377,6 +378,23 @@ atb::Status AddSfaSplitCpNode(const LatentAttentionParam<NormParamType> &param, 
 
     return atb::NO_ERROR;
 }
+
+
+template<typename NormParamType>
+atb::Status AddCastNode(const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
+                           std::map<std::string, uint32_t> &tensorMap, std::string in, std::string out, aclDataType out_type)
+{
+    atb::Node castNode;
+    atb::infer::ElewiseParam castParam;
+    castParam.elewiseType = atb::infer::ElewiseParam::ElewiseType::ELEWISE_CAST;
+    castParam.outTensorType = out_type;
+    CHECK_OPERATION_STATUS_RETURN(CreateOperation(castParam, &castNode.operation));
+    castNode.inTensorIds = {atb_speed::common::GetTensorIdx(tensorMap, in)};
+    castNode.outTensorIds = {atb_speed::common::GetTensorIdx(tensorMap, out)};
+    opGraph.nodes.push_back(castNode);
+    return atb::NO_ERROR;
+}
+
 
 template <typename NormParamType>
 atb::Status AddMlaPreprocessNode(const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
@@ -1844,16 +1862,14 @@ atb::Status AddSparseFlashAttentionCpNode(
     //CHECK_OPERATION_STATUS_RETURN(AddSfaSplitCpNode(param, opGraph, tensorMap,
     //    "intermediate_topk_indices_balance", "intermediate_topk_indices_prev", "intermediate_topk_indices_next"));
     
-    atb::Node aclnnSplitNode;
-    atb_speed::common::AclNNSplitWithSizeParam aclNNSplitParam;
-    aclNNSplitParam.dim = 0;
-    aclNNSplitParam.num = 2;
-    aclnnSplitNode.operation = new atb_speed::common::SplitWithSizeOperation("splitindex", aclNNSplitParam);
-    aclnnSplitNode.inTensorIds = {GetTensorIdx(tensorMap, "intermediate_topk_indices_balance")};
-    aclnnSplitNode.outTensorIds = {
-        GetTensorIdx(tensorMap, "intermediate_topk_indices_prev"),
-        GetTensorIdx(tensorMap, "intermediate_topk_indices_next")};
-    opGraph.nodes.push_back(aclnnSplitNode);
+    CHECK_OPERATION_STATUS_RETURN(AddCastNode(param, opGraph, tensorMap,
+        "intermediate_topk_indices_balance", "intermediate_topk_indices_balance_i64", ACL_INT64));
+    CHECK_OPERATION_STATUS_RETURN(AddSfaSplitCpNode(param, opGraph, tensorMap,
+        "intermediate_topk_indices_balance_i64", "intermediate_topk_indices_prev_i64", "intermediate_topk_indices_next_i64"));
+    CHECK_OPERATION_STATUS_RETURN(AddCastNode(param, opGraph, tensorMap,
+        "intermediate_topk_indices_prev_i64", "intermediate_topk_indices_prev", ACL_INT32));
+    CHECK_OPERATION_STATUS_RETURN(AddCastNode(param, opGraph, tensorMap,
+        "intermediate_topk_indices_next_i64", "intermediate_topk_indices_next", ACL_INT32));
 
     // get actual seq_lengths_query/seq_lengths_key 
     //      actual_seq_lengths_query_prev / actual_seq_lengths_key_prev
