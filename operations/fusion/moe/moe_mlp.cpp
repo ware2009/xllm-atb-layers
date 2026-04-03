@@ -824,7 +824,11 @@ atb::Status SetMoeDistributeDispatchParam(DispatchParam &dispatchParam, const Mo
     dispatchParam.localMoeExpertNum = param.numOfDeviceExperts;
     dispatchParam.sharedExpertRankNum = param.numDanglingSharedExperts;
     dispatchParam.topk = param.topk;
+    if (param.packQuantType == atb_speed::common::PackQuantType::ALL_W4A8) {
+        dispatchParam.expertTokenNumsType = 1;
+    }
     if (param.packQuantType == atb_speed::common::PackQuantType::ALL_W8A8_DYNAMIC ||
+        param.packQuantType == atb_speed::common::PackQuantType::ALL_W4A8 ||
         param.packQuantType == atb_speed::common::PackQuantType::ALL_W8A8_DYNAMIC_ANTI) {
         dispatchParam.quantMode = 2; // 2: translated2
         dispatchParam.isQuant = true;
