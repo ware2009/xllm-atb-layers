@@ -1,4 +1,3 @@
-
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
  *
@@ -37,10 +36,12 @@ enum LmHeadTensorIdx : uint32_t {
     IN_INDICES,
     IN_LOGITS_OFFSET,
     OUT_LOGITS,
+    OUT_SELECTED_HIDDEN, //If outputHidden is true, this is an externally provided out tensor; otherwise, it is an intermediate tensor.
 };
 
 static const uint64_t IN_TENSOR_COUNT = 9;
 static const uint64_t OUT_TENSOR_COUNT = 1;
+static const uint64_t OUT_TENSOR_COUNT_WITH_HIDDEN = 2;
 
 template <class T>
 int64_t AddSlice(atb::GraphParam &opGraph, const LmHeadParam &param, T &config)
@@ -190,14 +191,23 @@ atb::Status CreateLmHead(
     uint32_t RESULT_DIM_2 = 2;
     atb::GraphParam opGraph;
     opGraph.inTensorNum = IN_TENSOR_COUNT;
-    opGraph.outTensorNum = OUT_TENSOR_COUNT;
+    opGraph.outTensorNum =
+        (param.outputHidden && param.gatherAhead)
+            ? OUT_TENSOR_COUNT_WITH_HIDDEN
+            : OUT_TENSOR_COUNT;
     if (param.linearParallelParam.isArgmaxlogits) {
         opGraph.internalTensorNum =
             param.gatherAhead ? config.intermediateTensorCount + RESULT_OFFSET_5
                             : config.intermediateTensorCount + RESULT_OFFSET_4;
+        if (param.outputHidden && param.gatherAhead) {
+            opGraph.internalTensorNum -= 1;
+        }
     } else {
         opGraph.internalTensorNum =
             param.gatherAhead ? config.intermediateTensorCount : config.intermediateTensorCount - 1;
+        if (param.outputHidden && param.gatherAhead) {
+            opGraph.internalTensorNum -= 1;
+        }
     }
     opGraph.name = "LmHead";
 
@@ -253,6 +263,11 @@ atb::Status CreateLmHead(
             outTensorDescs.at(0).shape.dimNum = RESULT_DIM_2; // translated [batch_size,1]
             outTensorDescs.at(0).shape.dims[0] = inTensorDescs.at(IN_INDICES).shape.dims[0];
             outTensorDescs.at(0).shape.dims[1] = 1;
+            if (param.outputHidden && param.gatherAhead) {
+                outTensorDescs.at(1) = inTensorDescs.at(IN_HIDDENSTATES);
+                outTensorDescs.at(1).shape.dims[param.unpadInputs ? 0 : 1] =
+                    inTensorDescs.at(IN_INDICES).shape.dims[0];
+            }
         } else {
             outTensorDescs.at(0) = inTensorDescs.at(IN_HIDDENSTATES);
             CHECK_TENSORDESC_DIMNUM_VALID(inTensorDescs.at(IN_HIDDENSTATES).shape.dimNum);
@@ -273,6 +288,11 @@ atb::Status CreateLmHead(
             } else {
                 outTensorDescs.at(0).shape.dims[dimLast] = inTensorDescs.at(IN_WEIGHT).shape.dims[0];
             }
+            if (param.outputHidden && param.gatherAhead) {
+                outTensorDescs.at(1) = inTensorDescs.at(IN_HIDDENSTATES);
+                outTensorDescs.at(1).shape.dims[param.unpadInputs ? 0 : 1] =
+                    inTensorDescs.at(IN_INDICES).shape.dims[0];
+            }
         }
         return atb::NO_ERROR;
     };
@@ -287,7 +307,7 @@ public:
     uint64_t intermediateTensorCount = 1;
 
     enum LmHeadNoParallelTensorIdx : uint32_t {
-        INTERMEDIATE_GATHER_OUT = LmHeadTensorIdx::OUT_LOGITS + 1,
+        INTERMEDIATE_GATHER_OUT = LmHeadTensorIdx::OUT_SELECTED_HIDDEN,
         INTERMEDIATE_ALLGATHER_OUT,
         INTERMEDIATE_SLICE_OUT  // no usage
     };
@@ -300,9 +320,9 @@ public:
     uint64_t intermediateTensorCount = 2;
 
     enum LmHeadRowParallelTensorIdx : uint32_t {
-        INTERMEDIATE_SLICE_OUT = LmHeadTensorIdx::OUT_LOGITS + 1,
-        INTERMEDIATE_GATHER_OUT,
-        INTERMEDIATE_ALLGATHER_OUT,
+        INTERMEDIATE_GATHER_OUT = LmHeadTensorIdx::OUT_SELECTED_HIDDEN,
+        INTERMEDIATE_SLICE_OUT,
+        INTERMEDIATE_ALLGATHER_OUT // no usage
     };
 };
 
@@ -313,7 +333,7 @@ public:
     uint64_t intermediateTensorCount = 1;
 
     enum LmHeadColumnParallelTensorIdx : uint32_t {
-        INTERMEDIATE_GATHER_OUT = LmHeadTensorIdx::OUT_LOGITS + 1,
+        INTERMEDIATE_GATHER_OUT = LmHeadTensorIdx::OUT_SELECTED_HIDDEN,
         INTERMEDIATE_ALLGATHER_OUT,
         INTERMEDIATE_SLICE_OUT  // no usage
     };
@@ -340,3 +360,4 @@ atb::Status LmHead(const LmHeadParam &param, atb::Operation **operation)
 
 } // namespace common
 } // namespace atb_speed
+

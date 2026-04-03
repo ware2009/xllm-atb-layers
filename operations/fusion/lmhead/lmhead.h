@@ -38,6 +38,7 @@ struct LmHeadParam {
     int hiddenSizePerAttentionHead = 0;
     bool enableDpOut = false;
     /// Parameters passed to `LinearParallel`, see `operations/fusion/linear/linear_parallel.h` for more details.
+    bool outputHidden = false;
     atb_speed::common::LinearParallelParam linearParallelParam;
     
     atb_speed::common::ParallelInfo contextParallelInfo;
