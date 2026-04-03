@@ -46,6 +46,18 @@ void *Utils::GetCurrentStream()
     return stream;
 }
 
+uint64_t Utils::GetCurrentStreamId()
+{
+    int32_t devId = 0;
+    aclrtGetDevice(&devId);
+    return c10_npu::getCurrentNPUStream(devId).id();
+}
+
+int Utils::GetCurrentCaptureStatus()
+{
+    return static_cast<int>(c10_npu::currentStreamCaptureStatusMayInitCtx());
+}
+
 int64_t Utils::GetTensorNpuFormat(const at::Tensor &tensor)
 {
 #ifdef TORCH_HIGHER_THAN_PTA6

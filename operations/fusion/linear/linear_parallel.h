@@ -61,6 +61,9 @@ struct LinearParallelParam {
     int worldSize = 1;
     /// A flag indicating the prefill and decode phases
     bool isPrefill = false;
+    /// Force HCCL communication to use multi-thread mode for this linear-parallel op.
+    /// This is used by capture-sensitive subgraphs that provide an external comm domain.
+    bool forceCommMultiThread = false;
     /// The shape for inner tp slice
     int innerTpShape = 0;
     TensorParallelInfo tensorParallelInfo;

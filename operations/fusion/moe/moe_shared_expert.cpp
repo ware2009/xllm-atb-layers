@@ -22,6 +22,15 @@
 namespace atb_speed {
 namespace common {
 
+namespace {
+
+bool UseSingleStream(const SharedExpertParam &param)
+{
+    return param.forceSingleStream;
+}
+
+} // namespace
+
 std::map<std::string, std::vector<std::string>> GetSharedExpertInTensorCandidates()
 {
     std::map<std::string, std::vector<std::string>> sharedExpertInTensorCandidates = {
@@ -114,7 +123,7 @@ atb::Status CreateLinear(const SharedExpertParam &param, atb::GraphParam &opGrap
     linearParam.quantGroupSize = param.quantGroupSize;
     // enable prenormquant, skip quant in fusionlinear
     linearParam.enableSwiGLUQuantForSharedExperts = param.enablePreNormQuantForSharedExperts;
-    if (param.enableCVOverlap) {
+    if (param.enableCVOverlap && !UseSingleStream(param)) {
         linearParam.enableCVOverlap = true;
     }
     CHECK_OPERATION_STATUS_RETURN(FusionLinear(linearParam, &linearNode.operation));
@@ -216,7 +225,7 @@ atb::Status CreateLinearDown(const SharedExpertParam &param, atb::GraphParam &op
             ? param.packQuantType : param.denseQuantType,
         param.mlpLinearQuantType[SHARED_MOE_DOWN_LINEAR_INDEX], false);
     linearDownParam.quantGroupSize = param.quantGroupSize;
-    if (param.enableCVOverlap) {
+    if (param.enableCVOverlap && !UseSingleStream(param)) {
         linearDownParam.enableCVOverlap = true;
     }
     CHECK_OPERATION_STATUS_RETURN(FusionLinear(linearDownParam, &linearDownNode.operation));
@@ -328,14 +337,14 @@ atb::Status CreateSharedExpertOperation(const SharedExpertParam &param, atb::Ope
     std::map<std::string, uint32_t> tensorMap = ConstructTensorMap(
         param, opGraph.inTensorNum, opGraph.outTensorNum, opGraph.internalTensorNum);
 
-    if (param.enableCVOverlap) {
+    if (param.enableCVOverlap && !UseSingleStream(param)) {
         CHECK_OPERATION_STATUS_RETURN(atb_speed::common::CreateWaitWithoutNodeId(
             opGraph, atb_speed::EventAction::PUSH, atb_speed::common::CV_START));
     }
 
     CHECK_OPERATION_STATUS_RETURN(CreateLinear(param, opGraph, tensorMap));
 
-    if (param.enableCVOverlap) {
+    if (param.enableCVOverlap && !UseSingleStream(param)) {
         CHECK_OPERATION_STATUS_RETURN(atb_speed::common::CreateRecordWithoutNodeId(
             opGraph, atb_speed::EventAction::PUSH, atb_speed::common::CUBE_CONTROL));
         CHECK_OPERATION_STATUS_RETURN(atb_speed::common::CreateWaitWithoutNodeId(
@@ -345,7 +354,7 @@ atb::Status CreateSharedExpertOperation(const SharedExpertParam &param, atb::Ope
     CHECK_OPERATION_STATUS_RETURN(CreateActivationBlock(param, opGraph, tensorMap));
     CHECK_OPERATION_STATUS_RETURN(CreateLinearDown(param, opGraph, tensorMap));
 
-    if (param.enableCVOverlap) {
+    if (param.enableCVOverlap && !UseSingleStream(param)) {
         CHECK_OPERATION_STATUS_RETURN(atb_speed::common::CreateRecordWithoutNodeId(
             opGraph, atb_speed::EventAction::PUSH, atb_speed::common::CUBE_CONTROL));
     }

@@ -37,6 +37,15 @@ DECLARE_bool(enable_atb_comm_multiprocess);
 namespace atb_speed {
 namespace common {
 
+namespace {
+
+bool UseSingleStream(const SparseMoeParam &param)
+{
+    return param.forceSingleStream;
+}
+
+} // namespace
+
 const uint64_t NODE_SIZE_INCR_NORMALIZATION  = 2;
 static const uint64_t STREAM1 = 1;
 static const uint64_t NUM1 = 1;
@@ -246,7 +255,7 @@ atb::Status CreateSparseMoemoeGateFp32Atb(std::map<std::string, uint32_t> &tenso
     linearNode.outTensorIds = {GetTensorIdx(tensorMap, param.enableTopkFp32 ? "intermediate_router_logits" : "intermediate_router_logits_fp32")};
 
     CHECK_OPERATION_STATUS_RETURN(CreateOperation(moeGateParam, &linearNode.operation));
-    if (param.enableGatingOverlap) {
+    if (param.enableGatingOverlap && !UseSingleStream(param)) {
         atb::SetExecuteStreamId(linearNode.operation, STREAM1);
     }
     opGraph.nodes.push_back(linearNode);
@@ -281,7 +290,7 @@ atb::Status CreateSparseMoemoeGateFp32Aclnn(std::map<std::string, uint32_t> &ten
                               "in_hiddenstates_slice" : "in_hiddenstates"),
                               GetTensorIdx(tensorMap, "in_gate_weight")};
     linearNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_router_logits")};
-    if (param.enableGatingOverlap) {
+    if (param.enableGatingOverlap && !UseSingleStream(param)) {
         atb::SetExecuteStreamId(linearNode.operation, STREAM1);
     }
     opGraph.nodes.push_back(linearNode);
@@ -367,7 +376,7 @@ atb::Status CreateFusedAddTopk(std::map<std::string, uint32_t> &tensorMap,
                                        GetTensorIdx(tensorMap, "in_gate_bias")};
     fusedAddTopkNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_router_weights_topk_reduced_fp32"),
                                         GetTensorIdx(tensorMap, "intermediate_selected_experts")};
-    if (param.enableGatingOverlap) {
+    if (param.enableGatingOverlap && !UseSingleStream(param)) {
         atb::SetExecuteStreamId(fusedAddTopkNode.operation, STREAM1);
     }
     opGraph.nodes.push_back(fusedAddTopkNode);
@@ -394,7 +403,7 @@ atb::Status CreateFusedAddTopkDiv(std::map<std::string, uint32_t> &tensorMap,
                                        GetTensorIdx(tensorMap, "in_gate_bias")};
     fusedAddTopkDivNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_router_weights_topk_reduced_fp32"),
                                         GetTensorIdx(tensorMap, "intermediate_selected_experts")};
-    if (param.enableGatingOverlap) {
+    if (param.enableGatingOverlap && !UseSingleStream(param)) {
         atb::SetExecuteStreamId(fusedAddTopkDivNode.operation, STREAM1);
     }
     opGraph.nodes.push_back(fusedAddTopkDivNode);
@@ -696,6 +705,7 @@ atb::Status SetDynamicExpertParam(atb_speed::common::DynamicEpMoEParam &dynamicE
     dynamicExpertParam.moeEpRankTableFile = param.moeEpRankTableFile;
     dynamicExpertParam.quantGroupSize = param.quantGroupSize;
     dynamicExpertParam.enableCVOverlap = param.enableCVOverlap;
+    dynamicExpertParam.forceSingleStream = param.forceSingleStream;
     dynamicExpertParam.routingMethod = param.routingMethod;
     dynamicExpertParam.maxDecodeDpTokenSize = param.maxDecodeDpTokenSize;
     if (param.enableEPWB) {
@@ -743,7 +753,7 @@ atb::Status CreateFp16Cast(std::map<std::string, uint32_t> &tensorMap,
         castNode.inTensorIds = {GetTensorIdx(tensorMap, "intermediate_router_weights_topk_reduced_fp32")};
     }
     castNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_router_weights_topk_reduced_fp16")};
-    if (param.enableGatingOverlap) {
+    if (param.enableGatingOverlap && !UseSingleStream(param)) {
         atb::SetExecuteStreamId(castNode.operation, STREAM1);
     }
     opGraph.nodes.push_back(castNode);
@@ -967,7 +977,7 @@ atb::Status CreateConcatExpertOperation(
 atb::Status CreateRecord(const SparseMoeParam &param, atb::GraphParam &opGraph,
                          atb_speed::EventAction eventAction, const std::string &cvKey)
 {
-    if (param.enableCVOverlap || param.enableGatingOverlap) {
+    if ((param.enableCVOverlap || param.enableGatingOverlap) && !UseSingleStream(param)) {
         atb::Node recordNode;
         recordNode.inTensorIds = {};
         recordNode.outTensorIds = {};
@@ -987,7 +997,7 @@ atb::Status CreateRecord(const SparseMoeParam &param, atb::GraphParam &opGraph,
 atb::Status CreateWait(const SparseMoeParam &param, atb::GraphParam &opGraph,
                        atb_speed::EventAction eventAction, const std::string &cvKey)
 {
-    if (param.enableCVOverlap || param.enableGatingOverlap) {
+    if ((param.enableCVOverlap || param.enableGatingOverlap) && !UseSingleStream(param)) {
         atb::Node waitNode;
         waitNode.inTensorIds = {};
         waitNode.outTensorIds = {};

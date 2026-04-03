@@ -55,6 +55,8 @@ struct IntegratedGmmParam {
     bool enableMoeParallel = false;
     /// A flag indicating whether the model use cube and vector parallel
     bool enableCVOverlap = false;
+    /// Force graph construction onto a single stream
+    bool forceSingleStream = false;
     /// A flag indicating whether or not to use integrated GMM+Swiglu+quant operators.
     bool enableGMMSwigluQuant = false;
     /// A flag indicating whether or not to use fused atb GMM+Swiglu+quant operators instead of aclnn.

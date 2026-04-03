@@ -62,6 +62,7 @@ struct SparseMoeParam {
     bool enableSwigluQuant = false; /// A flag indicating whether to use swiglu-quant integrated operator
     bool enableMoeParallel = false; /// A flag indicating whether the model use Moe parallel
     bool enableCVOverlap = false; /// A flag indicating whether the model use cube and vector parallel
+    bool forceSingleStream = false; /// Force graph construction onto a single stream
     bool enableFusedTopk = false; /// A flag indicating whether to use fused topk operator
     bool enableTopkFp32 = false; /// A flag indicating whether to use FP32 fusetopk
     bool rounterHasBias = false;  /// A flag indicating whether is bias in the expert selection process

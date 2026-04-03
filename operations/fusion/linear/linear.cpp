@@ -473,6 +473,7 @@ int64_t AddLinear(atb::GraphParam &opGraph, const FusionLinearParam &param,
 
 atb::Status CreateFusionLinear(const FusionLinearParam &param, atb::Operation **operation)
 {
+    const bool enable_cv_overlap = param.enableCVOverlap && !param.forceSingleStream;
     atb::GraphParam opGraph;
     opGraph.name = param.quantType == NO_QUANT ? "LinearNoQuant" : \
         param.quantType == LINEAR_W8A8_DEQUANT || param.quantType == LINEAR_W8A8_SC_DEQUANT ? "LinearDequantOnly" : \
@@ -494,7 +495,7 @@ atb::Status CreateFusionLinear(const FusionLinearParam &param, atb::Operation **
             CHECK_OPERATION_STATUS_RETURN(AddAllGather(opGraph, param, tensorMap));
         }
     }
-    if (param.enableCVOverlap) {
+    if (enable_cv_overlap) {
         CHECK_OPERATION_STATUS_RETURN(atb_speed::common::CreateRecordWithoutNodeId(
             opGraph, atb_speed::EventAction::PUSH, atb_speed::common::VECTOR_CONTROL));
         CHECK_OPERATION_STATUS_RETURN(atb_speed::common::CreateWaitWithoutNodeId(

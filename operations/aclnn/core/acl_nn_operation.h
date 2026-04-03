@@ -100,6 +100,8 @@ protected:
     std::shared_ptr<AclNNOpCache> aclnnOpCache_ = nullptr;
     /// A human identifiable name for the operation's name.
     std::string opName_;
+    /// Guard against duplicate destroy calls from both derived and base destructors.
+    mutable bool operationDestroyed_ = false;
 };
 } // namespace common
 } // namespace atb_speed

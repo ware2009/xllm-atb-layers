@@ -41,6 +41,7 @@ struct SharedExpertParam {
     bool supportSwiGLU = true;  /// A flag indicating whether the device supports SwiGlu operator
     bool isBF16 = false; /// A flag indicating whether the model runs on bfloat16
     bool enableCVOverlap = false; /// A flag indicating whether the model use cube and vector parallel
+    bool forceSingleStream = false; /// Force graph construction onto a single stream
     int packQuantType = atb_speed::common::PackQuantType::ALL_FP;   /// The quantization type of the packed weights
     int quantGroupSize = 0; /// Group size of per-group quantization
     /// The quantization type used to facilitate the calculation of the quantization type of the linear operation

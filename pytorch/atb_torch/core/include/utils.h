@@ -25,6 +25,8 @@ namespace atb_torch {
 class Utils {
 public:
     static void *GetCurrentStream();
+    static uint64_t GetCurrentStreamId();
+    static int GetCurrentCaptureStatus();
     static int64_t GetTensorNpuFormat(const at::Tensor &tensor);
     static at::Tensor NpuFormatCast(const at::Tensor &tensor);
     static void BuildVariantPack(const std::vector<torch::Tensor> &inTensors,

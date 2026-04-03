@@ -70,6 +70,7 @@ struct DynamicEpMoEParam {
     std::string mlpTpDomain = "";
     std::string mlpTpRankTableFile = "";
     bool enableCVOverlap = false; /// A flag indicating whether the model use cube and vector parallel
+    bool forceSingleStream = false; /// Force graph construction onto a single stream
     bool enableMoeDistribute = false;
     bool enableExpertCumSumOutput = false;
     bool enableGatingDp = false;

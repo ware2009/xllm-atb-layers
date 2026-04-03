@@ -43,6 +43,15 @@
 namespace atb_speed {
 namespace common {
 
+namespace {
+
+bool UseSingleStream(const MoeMlpParam &param)
+{
+    return param.forceSingleStream;
+}
+
+} // namespace
+
 
 int CalcUpGmmQuantType(const MoeMlpParam &param)
 {
@@ -519,12 +528,13 @@ atb::Status CreateGmm(std::map<std::string, uint32_t> &tensorMap,
     gmmParam.enableAtlasGMMFused = param.enableAtlasGMMFused;
     gmmParam.enableIndexGmm = param.enableIndexGmm;
     gmmParam.enableInitRoutingV3 = param.enableInitRoutingV3;
+    gmmParam.forceSingleStream = param.forceSingleStream;
     if (param.enableInitQuant || (param.enableMoeDistribute &&
         (param.packQuantType == atb_speed::common::PackQuantType::ALL_W8A8_DYNAMIC \
             || param.packQuantType == atb_speed::common::PackQuantType::ALL_W4A8))) {
         gmmParam.skipQuant = true;
     }
-    if (param.enableCVOverlap) {gmmParam.enableCVOverlap = true;}
+    if (param.enableCVOverlap && !UseSingleStream(param)) {gmmParam.enableCVOverlap = true;}
     CHECK_OPERATION_STATUS_RETURN(CreateIntegratedGmmOperation(gmmParam, &gmmNode.operation));
     gmmNode.inTensorIds = {};
     gmmNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "intermediate_sorted_hiddenstates"));
@@ -724,6 +734,7 @@ atb::Status CreateGmm1(std::map<std::string, uint32_t> &tensorMap,
     gmmParam.packQuantType = param.packQuantType;
     gmmParam.transposeB = param.downTransposeB;
     gmmParam.enableIndexGmm = param.enableIndexGmm;
+    gmmParam.forceSingleStream = param.forceSingleStream;
     if (param.packQuantType == atb_speed::common::PackQuantType::ALL_W4A8) {
         gmmParam.hasBias = true;
     }
@@ -1039,7 +1050,7 @@ atb::Status CreateActivationBlock(std::map<std::string, uint32_t> &tensorMap,
 atb::Status CreateRecord(const MoeMlpParam &param, atb::GraphParam &opGraph,
                          atb_speed::EventAction eventAction, const std::string &cvKey)
 {
-    if (param.enableCVOverlap) {
+    if (param.enableCVOverlap && !UseSingleStream(param)) {
         atb::Node recordNode;
         recordNode.inTensorIds = {};
         recordNode.outTensorIds = {};
@@ -1056,7 +1067,7 @@ atb::Status CreateRecord(const MoeMlpParam &param, atb::GraphParam &opGraph,
 atb::Status CreateWait(const MoeMlpParam &param, atb::GraphParam &opGraph,
                        atb_speed::EventAction eventAction, const std::string &cvKey)
 {
-    if (param.enableCVOverlap) {
+    if (param.enableCVOverlap && !UseSingleStream(param)) {
         atb::Node waitNode;
         waitNode.inTensorIds = {};
         waitNode.outTensorIds = {};
@@ -1094,7 +1105,7 @@ atb::Status CreateFusedRouting(
 {
     std::shared_ptr<int64_t> batchDimPtr = std::make_shared<int64_t>(0);
     bool isGMMSwigluQuant = IsGMMSwigluQuant(CalcUpGmmQuantType(param), param);
-    if (param.enableCVOverlap) {
+    if (param.enableCVOverlap && !UseSingleStream(param)) {
         CHECK_OPERATION_STATUS_RETURN(CreateWait(
             param, opGraph, atb_speed::EventAction::POP, atb_speed::common::CUBE_CONTROL));
     }
@@ -1130,7 +1141,7 @@ atb::Status CreateFusedRouting(
 	CHECK_OPERATION_STATUS_RETURN(CreateGmm(tensorMap, opGraph, param));
     }
 
-    if (param.enableCVOverlap) {
+    if (param.enableCVOverlap && !UseSingleStream(param)) {
         CHECK_OPERATION_STATUS_RETURN(CreateWait(
             param, opGraph, atb_speed::EventAction::POP, atb_speed::common::VECTOR_CONTROL));
         CHECK_OPERATION_STATUS_RETURN(CreateRecord(
@@ -1151,7 +1162,7 @@ atb::Status CreateFusedRouting(
     }
 
     CHECK_OPERATION_STATUS_RETURN(CreateMoeTokenUnpermute(tensorMap, param, opGraph));
-    if (param.enableCVOverlap) {
+    if (param.enableCVOverlap && !UseSingleStream(param)) {
         CHECK_OPERATION_STATUS_RETURN(CreateWait(
             param, opGraph, atb_speed::EventAction::POP, atb_speed::common::CUBE_CONTROL));
     }

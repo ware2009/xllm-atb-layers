@@ -288,6 +288,7 @@ atb::Status SetMoeMlpParam(atb_speed::common::MoeMlpParam &mlpExpertParam, const
     mlpExpertParam.quantGroupSize = param.quantGroupSize;
     mlpExpertParam.enableGMMSwigluQuant = param.enableGMMSwigluQuant;
     mlpExpertParam.enableCVOverlap = param.enableCVOverlap;
+    mlpExpertParam.forceSingleStream = param.forceSingleStream;
     mlpExpertParam.backend = param.backend;
     mlpExpertParam.hasMoeEp = param.hasMoeEp;
     mlpExpertParam.moeEpRank = param.moeEpRank;
