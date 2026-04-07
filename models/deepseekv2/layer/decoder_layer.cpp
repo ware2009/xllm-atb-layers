@@ -750,6 +750,12 @@ int64_t SetAllGather(atb::GraphParam &opGraph, const DecoderLayerParam &param,
         allGatherParam.rankSize = parallelInfo.rankIds.size();
         allGatherParam.backend = parallelInfo.defaultBackend;
         parallelInfo.InitCommDomain(allGatherParam.hcclComm, allGatherParam.commDomain);
+    } else if (param.mapping.Get(base::ATTN_CP).IsEnabled()) {
+        atb_speed::common::ParallelInfo parallelInfo = param.mapping.Get(base::ATTN_CP);
+        allGatherParam.rank = parallelInfo.rank;
+        allGatherParam.rankSize = parallelInfo.rankIds.size();
+        allGatherParam.backend = parallelInfo.defaultBackend;
+        parallelInfo.InitCommDomain(allGatherParam.hcclComm, allGatherParam.commDomain);
     } else {
         atb_speed::common::ParallelInfo parallelInfo = param.mapping.Get(base::ATTN_DP);
         allGatherParam.rank = parallelInfo.rank;
