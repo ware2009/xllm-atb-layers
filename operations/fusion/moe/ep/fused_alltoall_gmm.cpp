@@ -22,6 +22,7 @@
 #include "operations/aclnn/ops/moe_init_routing_quant_operation.h"
 #include "operations/aclnn/ops/dequant_swiglu_quant_operation.h"
 #include "operations/aclnn/ops/dynamic_quant_operation.h"
+#include "operations/aclnn/ops/cast_operation.h"
 
 namespace atb_speed {
 namespace common {
@@ -50,9 +51,11 @@ std::map<std::string, std::vector<std::string>> GetAll2AllMatmulInterTensorCandi
             "intermediate_group_list",
             "intermediate_dynamic_scale",
             "intermediate_group_list_full",
+            "intermediate_gateup_scale_fp32",
             "intermediate_gate_up_out",
             "intermediate_quant_swish_out",
             "intermediate_swish_out_scale",
+            "intermediate_down_scale_fp32",
             "intermediate_mlp_out",
             "intermediate_tokens_before_capacity"
             }
@@ -155,20 +158,42 @@ atb::Status CreateAll2AllMatmul(std::map<std::string, uint32_t> &tensorMap, cons
     allToAllMatmulParam.moeInfo.epSize = param.moeEpSize;
     allToAllMatmulParam.moeInfo.tpSize = 1;
     allToAllMatmulParam.moeInfo.localExpertNums = param.numOfDeviceExperts;
-    allToAllMatmulParam.outDataType = aclDataType::ACL_FLOAT16;
+    allToAllMatmulParam.outDataType = param.isBF16 ? aclDataType::ACL_BF16 : aclDataType::ACL_FLOAT16;
 
     CHECK_OPERATION_STATUS_RETURN(CreateOperation(allToAllMatmulParam, &allToAllMatmulNode.operation));
 
     allToAllMatmulNode.inTensorIds = {
         GetTensorIdx(tensorMap, "intermediate_hiddenstates"),
         GetTensorIdx(tensorMap, "in_mlp_gateup_weight_expert"),
-        GetTensorIdx(tensorMap, "in_mlp_gateup_scale_expert"),  // per channel
+        GetTensorIdx(tensorMap, "intermediate_gateup_scale_fp32"),  // per channel
         GetTensorIdx(tensorMap, "intermediate_dynamic_scale"),  // per token
         GetTensorIdx(tensorMap, "intermediate_group_list_full"),  // expert_per_token_matrix [ep, 256]
         GetTensorIdx(tensorMap, "in_moe_idx")
     };
     allToAllMatmulNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_gate_up_out")};
     ATB_SPEED_LOG_DEBUG("FusedAlltoallGMM Create AllGather success");
+    return atb::NO_ERROR;
+}
+
+atb::Status CreateGateupScaleCast(std::map<std::string, uint32_t> &tensorMap, atb::GraphParam &opGraph, size_t &nodeId)
+{
+    atb::Node &castNode = opGraph.nodes.at(nodeId++);
+    atb_speed::common::AclNNCastParam castParam;
+    castParam.dtype = ACL_FLOAT;
+    castNode.operation = new atb_speed::common::CastOperation("All2AllMatmulGateupScaleCast", castParam);
+    castNode.inTensorIds = {GetTensorIdx(tensorMap, "in_mlp_gateup_scale_expert")};
+    castNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_gateup_scale_fp32")};
+    return atb::NO_ERROR;
+}
+
+atb::Status CreateDownScaleCast(std::map<std::string, uint32_t> &tensorMap, atb::GraphParam &opGraph, size_t &nodeId)
+{
+    atb::Node &castNode = opGraph.nodes.at(nodeId++);
+    atb_speed::common::AclNNCastParam castParam;
+    castParam.dtype = ACL_FLOAT;
+    castNode.operation = new atb_speed::common::CastOperation("All2AllMatmulDownScaleCast", castParam);
+    castNode.inTensorIds = {GetTensorIdx(tensorMap, "in_mlp_down_scale_expert")};
+    castNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_down_scale_fp32")};
     return atb::NO_ERROR;
 }
 
@@ -207,14 +232,14 @@ atb::Status CreateMatmulAll2All(std::map<std::string, uint32_t> &tensorMap,
     matmulAllToAllParam.moeInfo.localExpertNums = param.numOfDeviceExperts;
     matmulAllToAllParam.moeInfo.tpSize = 1;
     matmulAllToAllParam.moeInfo.epSize = param.moeEpSize;
-    matmulAllToAllParam.outDataType = aclDataType::ACL_FLOAT16;
+    matmulAllToAllParam.outDataType = param.isBF16 ? aclDataType::ACL_BF16 : aclDataType::ACL_FLOAT16;
 
     CHECK_OPERATION_STATUS_RETURN(CreateOperation(matmulAllToAllParam, &matmulAllToAllNode.operation));
 
     matmulAllToAllNode.inTensorIds = {
         GetTensorIdx(tensorMap, "intermediate_quant_swish_out"),
         GetTensorIdx(tensorMap, "in_mlp_down_weight_expert"),
-        GetTensorIdx(tensorMap, "in_mlp_down_scale_expert"),
+        GetTensorIdx(tensorMap, "intermediate_down_scale_fp32"),
         GetTensorIdx(tensorMap, "intermediate_swish_out_scale"),
         GetTensorIdx(tensorMap, "intermediate_group_list_full"),
         GetTensorIdx(tensorMap, "intermediate_idx")
@@ -246,14 +271,16 @@ atb::Status CreateAll2AllMatmulOperation(const All2AllMatmulParam &param, atb::O
     std::map<std::string, uint32_t> tensorMap = ConstructDynamicEpTensorMap(
         opGraph.inTensorNum, opGraph.outTensorNum, opGraph.internalTensorNum);
 
-    uint64_t nodeCount = 6;
+    uint64_t nodeCount = 8;
     opGraph.nodes.resize(nodeCount);
 
     size_t nodeId = 0;
     CHECK_OPERATION_STATUS_RETURN(CreateInitRoutingQuant(tensorMap, param, opGraph, nodeId));
     CHECK_OPERATION_STATUS_RETURN(CreateGrouplistAllGather(tensorMap, param, opGraph, nodeId));
+    CHECK_OPERATION_STATUS_RETURN(CreateGateupScaleCast(tensorMap, opGraph, nodeId));
     CHECK_OPERATION_STATUS_RETURN(CreateAll2AllMatmul(tensorMap, param, opGraph, nodeId));
     CHECK_OPERATION_STATUS_RETURN(CreateSwigluQuant(tensorMap, opGraph, nodeId));
+    CHECK_OPERATION_STATUS_RETURN(CreateDownScaleCast(tensorMap, opGraph, nodeId));
     CHECK_OPERATION_STATUS_RETURN(CreateMatmulAll2All(tensorMap, param, opGraph, nodeId));
     CHECK_OPERATION_STATUS_RETURN(CreateMoeTokenUnpermute(tensorMap, opGraph, nodeId));
     

@@ -360,4 +360,3 @@ atb::Status LmHead(const LmHeadParam &param, atb::Operation **operation)
 
 } // namespace common
 } // namespace atb_speed
-

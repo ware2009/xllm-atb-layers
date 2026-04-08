@@ -29,15 +29,6 @@ static const int IDX2 = 2;
 static const int IDX3 = 3;
 static const int IDX6 = 6;
 
-namespace {
-
-bool UseSingleStream(const IntegratedGmmParam &param)
-{
-    return param.forceSingleStream;
-}
-
-} // namespace
-
 std::map<std::string, std::vector<std::string>> GetInteGmmInTensorCandidates()
 {
     std::map<std::string, std::vector<std::string>> inteGmmInTensorCandidates = {
@@ -364,7 +355,7 @@ atb::Status CreateGmm1(std::map<std::string, uint32_t> &tensorMap,
 atb::Status CreateRecord(const IntegratedGmmParam &param, atb::GraphParam &opGraph, size_t &nodeId,
                          atb_speed::EventAction eventAction, const std::string &cvKey)
 {
-    if (param.enableCVOverlap && !UseSingleStream(param)) {
+    if (param.enableCVOverlap) {
         atb::Node &recordNode = opGraph.nodes.at(nodeId++);
         recordNode.inTensorIds = {};
         recordNode.outTensorIds ={};
@@ -397,7 +388,7 @@ atb::Status CreateIntegratedGmmOperation(const IntegratedGmmParam &param, atb::O
     if ((gmmQuantType == GmmQuantType::W8A8_TOKEN || gmmQuantType == GmmQuantType::W4A8_GROUP) && !param.skipQuant) {
         CHECK_OPERATION_STATUS_RETURN(SetAclnnDynamicQuantNode(tensorMap, opGraph, nodeId));
     }
-    if (param.enableCVOverlap && !UseSingleStream(param)) {
+    if (param.enableCVOverlap) {
         CHECK_OPERATION_STATUS_RETURN(CreateRecord(
             param, opGraph, nodeId, atb_speed::EventAction::POP, atb_speed::common::VECTOR_CONTROL));
     }

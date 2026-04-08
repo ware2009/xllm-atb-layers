@@ -27,6 +27,7 @@
 #include "operations/aclnn/ops/std_operation.h"
 #include "operations/aclnn/ops/sigmoid_operation.h"
 #include "operations/aclnn/ops/matmul_operation.h"
+#include "operations/aclnn/ops/cast_operation.h"
 #include "operations/aclnn/ops/concat_operation.h"
 #include "operations/aclnn/ops/moe_fused_add_topk.h"
 #include "operations/aclnn/ops/moe_fused_reducesum_div_operation.h"
@@ -37,15 +38,6 @@ DECLARE_bool(enable_atb_comm_multiprocess);
 namespace atb_speed {
 namespace common {
 
-namespace {
-
-bool UseSingleStream(const SparseMoeParam &param)
-{
-    return param.forceSingleStream;
-}
-
-} // namespace
-
 const uint64_t NODE_SIZE_INCR_NORMALIZATION  = 2;
 static const uint64_t STREAM1 = 1;
 static const uint64_t NUM1 = 1;
@@ -55,6 +47,7 @@ static const uint64_t NUM4 = 4;
 static const uint64_t NUM5 = 5;
 constexpr uint32_t TOPK_IN_NUM = 4;
 constexpr uint32_t TOPK_IN3_DIM = 3;
+constexpr const char* FUSED_ADD_TOPK_ADDNUM_FP32 = "intermediate_router_bias_fp32";
 
 std::map<std::string, std::vector<std::string>> GetSparseMoeInTensorCandidates()
 {
@@ -195,6 +188,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(
         inTensorList.push_back("mix_shared_routing_weight");
         inTensorList.push_back("mix_shared_routing_expert");
     }
+    if (param.forceMoeFusedAddTopkAddNumFp32) {
+        interTensorList.push_back(FUSED_ADD_TOPK_ADDNUM_FP32);
+    }
     inTensorNum = inTensorList.size();
     outTensorNum = outTensorList.size();
     interTensorNum = interTensorList.size();
@@ -235,13 +231,12 @@ atb::Status CreateSparseMoemoeGateFp32Atb(std::map<std::string, uint32_t> &tenso
 {
     if (!param.enableFp32GateInput) {
         atb::Node castUp;
-        atb::infer::ElewiseParam castUpParam;
-        castUpParam.elewiseType = atb::infer::ElewiseParam::ElewiseType::ELEWISE_CAST;
-        castUpParam.outTensorType = ACL_FLOAT;
+        atb_speed::common::AclNNCastParam castUpParam;
+        castUpParam.dtype = ACL_FLOAT;
+        castUp.operation = new atb_speed::common::CastOperation("SparseMoeGateCastUp", castUpParam);
         castUp.inTensorIds = {GetTensorIdx(tensorMap, (param.enableGatingDp) ?
                                 "in_hiddenstates_slice" : "in_hiddenstates")};
         castUp.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_hiddenstates_fp32")};
-        CHECK_OPERATION_STATUS_RETURN(CreateOperation(castUpParam, &castUp.operation));
         opGraph.nodes.push_back(castUp);
     }
 
@@ -255,7 +250,7 @@ atb::Status CreateSparseMoemoeGateFp32Atb(std::map<std::string, uint32_t> &tenso
     linearNode.outTensorIds = {GetTensorIdx(tensorMap, param.enableTopkFp32 ? "intermediate_router_logits" : "intermediate_router_logits_fp32")};
 
     CHECK_OPERATION_STATUS_RETURN(CreateOperation(moeGateParam, &linearNode.operation));
-    if (param.enableGatingOverlap && !UseSingleStream(param)) {
+    if (param.enableGatingOverlap) {
         atb::SetExecuteStreamId(linearNode.operation, STREAM1);
     }
     opGraph.nodes.push_back(linearNode);
@@ -290,7 +285,7 @@ atb::Status CreateSparseMoemoeGateFp32Aclnn(std::map<std::string, uint32_t> &ten
                               "in_hiddenstates_slice" : "in_hiddenstates"),
                               GetTensorIdx(tensorMap, "in_gate_weight")};
     linearNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_router_logits")};
-    if (param.enableGatingOverlap && !UseSingleStream(param)) {
+    if (param.enableGatingOverlap) {
         atb::SetExecuteStreamId(linearNode.operation, STREAM1);
     }
     opGraph.nodes.push_back(linearNode);
@@ -373,14 +368,27 @@ atb::Status CreateFusedAddTopk(std::map<std::string, uint32_t> &tensorMap,
     // CHECK_OPERATION_STATUS_RETURN(CreateOperation(fusedAddTopkDivParam, &fusedAddTopkNode.operation));
     fusedAddTopkNode.inTensorIds = {GetTensorIdx(tensorMap, (param.enableGatingShift) ? \
                                        "intermediate_router_logits_shifted" : "intermediate_router_logits"),
-                                       GetTensorIdx(tensorMap, "in_gate_bias")};
+                                       GetTensorIdx(tensorMap, param.forceMoeFusedAddTopkAddNumFp32 ? \
+                                       FUSED_ADD_TOPK_ADDNUM_FP32 : "in_gate_bias")};
     fusedAddTopkNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_router_weights_topk_reduced_fp32"),
                                         GetTensorIdx(tensorMap, "intermediate_selected_experts")};
-    if (param.enableGatingOverlap && !UseSingleStream(param)) {
+    if (param.enableGatingOverlap) {
         atb::SetExecuteStreamId(fusedAddTopkNode.operation, STREAM1);
     }
     opGraph.nodes.push_back(fusedAddTopkNode);
     ATB_SPEED_LOG_DEBUG("FusedAddTopkOperation calculation success");
+    return atb::NO_ERROR;
+}
+
+atb::Status CreateFusedAddTopkAddNumCast(std::map<std::string, uint32_t> &tensorMap, atb::GraphParam &opGraph)
+{
+    atb::Node castNode;
+    atb_speed::common::AclNNCastParam castParam;
+    castParam.dtype = ACL_FLOAT;
+    castNode.operation = new atb_speed::common::CastOperation("SparseMoeFusedAddTopkAddNumCast", castParam);
+    castNode.inTensorIds = {GetTensorIdx(tensorMap, "in_gate_bias")};
+    castNode.outTensorIds = {GetTensorIdx(tensorMap, FUSED_ADD_TOPK_ADDNUM_FP32)};
+    opGraph.nodes.push_back(castNode);
     return atb::NO_ERROR;
 }
 
@@ -403,7 +411,7 @@ atb::Status CreateFusedAddTopkDiv(std::map<std::string, uint32_t> &tensorMap,
                                        GetTensorIdx(tensorMap, "in_gate_bias")};
     fusedAddTopkDivNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_router_weights_topk_reduced_fp32"),
                                         GetTensorIdx(tensorMap, "intermediate_selected_experts")};
-    if (param.enableGatingOverlap && !UseSingleStream(param)) {
+    if (param.enableGatingOverlap) {
         atb::SetExecuteStreamId(fusedAddTopkDivNode.operation, STREAM1);
     }
     opGraph.nodes.push_back(fusedAddTopkDivNode);
@@ -705,7 +713,6 @@ atb::Status SetDynamicExpertParam(atb_speed::common::DynamicEpMoEParam &dynamicE
     dynamicExpertParam.moeEpRankTableFile = param.moeEpRankTableFile;
     dynamicExpertParam.quantGroupSize = param.quantGroupSize;
     dynamicExpertParam.enableCVOverlap = param.enableCVOverlap;
-    dynamicExpertParam.forceSingleStream = param.forceSingleStream;
     dynamicExpertParam.routingMethod = param.routingMethod;
     dynamicExpertParam.maxDecodeDpTokenSize = param.maxDecodeDpTokenSize;
     if (param.enableEPWB) {
@@ -727,10 +734,9 @@ atb::Status SetDynamicExpertParam(atb_speed::common::DynamicEpMoEParam &dynamicE
 atb::Status CreateFp32Cast(std::map<std::string, uint32_t> &tensorMap, atb::GraphParam &opGraph)
 {
     atb::Node castNode;
-    atb::infer::ElewiseParam castParam;
-    castParam.elewiseType = atb::infer::ElewiseParam::ElewiseType::ELEWISE_CAST;
-    castParam.outTensorType = ACL_FLOAT;
-    CHECK_OPERATION_STATUS_RETURN(CreateOperation(castParam, &castNode.operation));
+    atb_speed::common::AclNNCastParam castParam;
+    castParam.dtype = ACL_FLOAT;
+    castNode.operation = new atb_speed::common::CastOperation("SparseMoeFp32Cast", castParam);
     castNode.inTensorIds = {GetTensorIdx(tensorMap, "intermediate_router_weights_topk_reduced")};
     castNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_router_weights_topk_reduced_fp32")};
     opGraph.nodes.push_back(castNode);
@@ -753,7 +759,7 @@ atb::Status CreateFp16Cast(std::map<std::string, uint32_t> &tensorMap,
         castNode.inTensorIds = {GetTensorIdx(tensorMap, "intermediate_router_weights_topk_reduced_fp32")};
     }
     castNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_router_weights_topk_reduced_fp16")};
-    if (param.enableGatingOverlap && !UseSingleStream(param)) {
+    if (param.enableGatingOverlap) {
         atb::SetExecuteStreamId(castNode.operation, STREAM1);
     }
     opGraph.nodes.push_back(castNode);
@@ -977,7 +983,7 @@ atb::Status CreateConcatExpertOperation(
 atb::Status CreateRecord(const SparseMoeParam &param, atb::GraphParam &opGraph,
                          atb_speed::EventAction eventAction, const std::string &cvKey)
 {
-    if ((param.enableCVOverlap || param.enableGatingOverlap) && !UseSingleStream(param)) {
+    if (param.enableCVOverlap || param.enableGatingOverlap) {
         atb::Node recordNode;
         recordNode.inTensorIds = {};
         recordNode.outTensorIds = {};
@@ -997,7 +1003,7 @@ atb::Status CreateRecord(const SparseMoeParam &param, atb::GraphParam &opGraph,
 atb::Status CreateWait(const SparseMoeParam &param, atb::GraphParam &opGraph,
                        atb_speed::EventAction eventAction, const std::string &cvKey)
 {
-    if ((param.enableCVOverlap || param.enableGatingOverlap) && !UseSingleStream(param)) {
+    if (param.enableCVOverlap || param.enableGatingOverlap) {
         atb::Node waitNode;
         waitNode.inTensorIds = {};
         waitNode.outTensorIds = {};
@@ -1103,8 +1109,11 @@ atb::Status CreateSparseMoeOperation(const SparseMoeParam &param, atb::Operation
         CHECK_OPERATION_STATUS_RETURN(CreateSplit(tensorMap, param, opGraph));
         CHECK_OPERATION_STATUS_RETURN(CreateConcat(tensorMap, param, opGraph));
     }
+    if (param.enableFusedTopk && param.forceMoeFusedAddTopkAddNumFp32) {
+        CHECK_OPERATION_STATUS_RETURN(CreateFusedAddTopkAddNumCast(tensorMap, opGraph));
+    }
     CHECK_OPERATION_STATUS_RETURN(RoutingBlock(tensorMap, param, opGraph));
-    
+
     bool skipCast = !param.enableFusedTopk && !param.enableMoeDistribute && (param.processLogits != "none") && (!param.enableFusedTopk || param.enableGatingDp) && !param.mixSharedRouting;
     if (!param.enableFusedTopk && param.processLogits != "none") {
         if (param.processLogits == "normalization") {

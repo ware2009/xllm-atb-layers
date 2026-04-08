@@ -53,7 +53,6 @@ struct MoeMlpParam {
     bool enableSwigluQuant = false; /// A flag indicating whether to use swiglu-quant integrated operator
     bool enableMoeParallel = false; /// A flag indicating whether the model use Moe parallel
     bool enableCVOverlap = false; /// A flag indicating whether the model use cube and vector parallel
-    bool forceSingleStream = false; /// Force graph construction onto a single stream
     bool hasMoeEp = false; /// A flag indicating whether the model uses expert parallelism
     bool enableDispatchCombineV2 = false; /// A flag indicating whether to use dispatch_v2 and combine_v2
     int packQuantType = atb_speed::common::PackQuantType::ALL_FP;   /// The quantization type of the packed weights

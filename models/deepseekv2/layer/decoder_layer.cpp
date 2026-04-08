@@ -1011,6 +1011,10 @@ atb::Status SetSparseMoeParam(atb_speed::common::SparseMoeParam &sparseMoeParam,
     sparseMoeParam.enableInitQuant = param.enableInitQuant;
     sparseMoeParam.enableSwigluQuant = param.enableSwigluQuant;
     sparseMoeParam.enableFusedTopk = param.enableFusedTopk;
+    // Ascend aclnn MoeFusedAddTopk requires addNum dtype to match x dtype.
+    // DeepSeek BF16 router path provides in_gate_bias in BF16 while x is FP32.
+    // Force an explicit cast only on this path.
+    sparseMoeParam.forceMoeFusedAddTopkAddNumFp32 = sparseMoeParam.enableFusedTopk && param.isBF16;
     sparseMoeParam.enableExpertCumSumOutput = param.enableExpertCumSumOutput;
     sparseMoeParam.enableATBGateMatmul = param.enableATBGateMatmul;
     sparseMoeParam.enableFp32GateInput = isGatherPreNorm(param) && param.isDynamicEp;
@@ -1954,4 +1958,3 @@ DecoderLayer::~DecoderLayer() {}
 
 } // namespace deepseekV2
 } // namespace atb_speed
-

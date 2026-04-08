@@ -35,6 +35,7 @@ struct All2AllMatmulParam {
     int32_t scaledTopk = -1;
     int moeEpRank = 0;
     int moeEpSize = 1;
+    bool isBF16 = false;
     std::string lcclMoeEpDomain = "";
     HcclComm lcclMoeEpHcclComm = nullptr;
 };
