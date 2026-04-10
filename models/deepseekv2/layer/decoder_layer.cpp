@@ -1011,13 +1011,16 @@ atb::Status SetSparseMoeParam(atb_speed::common::SparseMoeParam &sparseMoeParam,
     sparseMoeParam.enableInitQuant = param.enableInitQuant;
     sparseMoeParam.enableSwigluQuant = param.enableSwigluQuant;
     sparseMoeParam.enableFusedTopk = param.enableFusedTopk;
+    sparseMoeParam.enableTopkFp32 = (param.index_n_heads > 0);
+    const bool fp32GateInput = isGatherPreNorm(param) && param.isDynamicEp;
     // Ascend aclnn MoeFusedAddTopk requires addNum dtype to match x dtype.
-    // DeepSeek BF16 router path provides in_gate_bias in BF16 while x is FP32.
-    // Force an explicit cast only on this path.
-    sparseMoeParam.forceMoeFusedAddTopkAddNumFp32 = sparseMoeParam.enableFusedTopk && param.isBF16;
+    // Cast addNum to FP32 only when fused topk consumes FP32 router logits.
+    sparseMoeParam.forceMoeFusedAddTopkAddNumFp32 =
+        sparseMoeParam.enableFusedTopk && param.enableATBGateMatmul &&
+        sparseMoeParam.enableTopkFp32;
     sparseMoeParam.enableExpertCumSumOutput = param.enableExpertCumSumOutput;
     sparseMoeParam.enableATBGateMatmul = param.enableATBGateMatmul;
-    sparseMoeParam.enableFp32GateInput = isGatherPreNorm(param) && param.isDynamicEp;
+    sparseMoeParam.enableFp32GateInput = fp32GateInput;
     sparseMoeParam.enableGMMSwigluQuant = param.enableGMMSwigluQuant;
     sparseMoeParam.enableAtlasGMMFused = param.enableAtlasGMMFused;
     sparseMoeParam.enableCVOverlap = param.enableCVOverlap;
@@ -1035,9 +1038,6 @@ atb::Status SetSparseMoeParam(atb_speed::common::SparseMoeParam &sparseMoeParam,
     sparseMoeParam.mixSharedRouting = param.mixSharedRouting;
     sparseMoeParam.enableInitRoutingV3 = !param.isPrefill && !param.mapping.Get(base::MOE_EP).IsEnabled();
 
-    if (param.index_n_heads > 0) {
-        sparseMoeParam.enableTopkFp32 = true;
-    }
     return atb::NO_ERROR;
 }
 

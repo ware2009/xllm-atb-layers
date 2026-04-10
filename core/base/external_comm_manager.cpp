@@ -201,19 +201,23 @@ std::string ExternalCommManager::GetHcclGlobalCommDomain(std::shared_ptr<CommInf
         HcclGetCommName(this->globalComm_, hcclCommName);
         commDomain = std::string(hcclCommName);
     } else {
-        // Without rank table, create a real global HCCL communicator so
+        // Without rank table, try to create a real global HCCL communicator so
         // downstream aclnn ops can resolve the comm group by name.
+        // If creation fails, fall back to the historical behavior (no global
+        // HCCL comm, self-assigned commDomain in sub-comm path).
         char commName[128] = {};
         this->globalComm_ =
             atb::Comm::CreateHcclComm(commInfo->subCommRankId_, 0, this->worldSize_, commName);
-        if (this->globalComm_ == nullptr) {
-            throw std::runtime_error(
-                "External Comm Manager: Create global hccl communication group failed without rank table.");
+        if (this->globalComm_ != nullptr) {
+            commInfo->hcclComm_ = this->globalComm_;
+            char hcclCommName[128] = {};
+            HcclGetCommName(this->globalComm_, hcclCommName);
+            commDomain = std::string(hcclCommName);
+        } else {
+            ATB_SPEED_LOG_ERROR(
+                "External Comm Manager: Create global hccl communication group failed without rank table. "
+                "Fallback to non-global-comm mode.");
         }
-        commInfo->hcclComm_ = this->globalComm_;
-        char hcclCommName[128] = {};
-        HcclGetCommName(this->globalComm_, hcclCommName);
-        commDomain = std::string(hcclCommName);
     }
     ATB_SPEED_LOG_DEBUG("GetHcclGlobalCommDomain end.");
 
