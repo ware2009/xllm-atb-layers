@@ -23,6 +23,7 @@
 #include "atb/atb_infer.h"
 #include "atb_speed/base/hosttensor_binder.h"
 #include "nlohmann/json.hpp"
+#include "operations/fusion/utils.h"
 
 namespace atb_speed {
 namespace onerec {
@@ -33,16 +34,19 @@ const uint64_t MLP_DOWN_LINEAR_INDEX = 2;
 
 // OneRec MoE configuration structure
 struct OneRecMoEConfig {
-  int moe_topk = 2;         // Number of experts to activate per token
-  int moe_num_experts = 8;  // Total number of experts
+  int moe_topk = 2;        // Number of experts to activate per token
+  int moe_num_experts = 8; // Total number of experts
   std::string moe_score_func =
-      "softmax";                        // Gate function: "softmax" or "sigmoid"
-  float moe_route_scale = 1.0f;         // Routing scale factor
-  int moe_inter_dim = 1024;             // Expert intermediate dimension
-  bool use_bf16 = true;                 // Use bfloat16 precision
-  bool moe_use_shared_experts = false;  // Whether to use shared experts
-  bool hasSharedExpertGate = false;     // Whether to use shared gate
-  int moe_num_shared_experts = 0;       // Number of shared experts
+      "softmax";                       // Gate function: "softmax" or "sigmoid"
+  float moe_route_scale = 1.0f;        // Routing scale factor
+  int moe_inter_dim = 1024;            // Expert intermediate dimension
+  bool use_bf16 = true;                // Use bfloat16 precision
+  bool moe_use_shared_experts = false; // Whether to use shared experts
+  bool hasSharedExpertGate = false;    // Whether to use shared gate
+  int moe_num_shared_experts = 0;      // Number of shared experts
+  // Whether to use ACLNN integrated softmax + topk for router gating.
+  // This is only meaningful when moe_score_func == "softmax".
+  bool enable_integrated_softmax_topk = false;
 };
 
 struct BlockLayerParam {
@@ -51,6 +55,7 @@ struct BlockLayerParam {
   bool isBF16 = true;
   bool isPack = true;
   bool supportSwiGLU = false;
+  bool enableSwiGLUQuantForSharedExperts = false;
   bool supportLcoc = false;
   bool supportSpeculate = false;
   bool enableSplitFuse = false;
@@ -60,10 +65,11 @@ struct BlockLayerParam {
   bool kvQuant = false;
   bool enableIntraLayerAddNorm = false;
   bool enableInterLayerAddNorm = false;
-  // OneRec position bias is now passed through attention_mask with ALIBI mask type
-  // hasPositionBias parameter is no longer needed
+  // OneRec position bias is now passed through attention_mask with ALIBI mask
+  // type hasPositionBias parameter is no longer needed
   bool isDecoder = false;
   std::string backend = "lccl";
+  int matmulBackend = atb_speed::common::OpBackend::ATB;
   int rank = 0;
   int worldSize = 1;
   int quantType = 0;
@@ -71,6 +77,7 @@ struct BlockLayerParam {
   int numAttentionHeadsPerRank = 0;
   int hiddenSizePerAttentionHead = 0;
   int numKeyValueHeadsPerRank = 0;
+  bool useAttentionScaling = false;
   float rmsNormEps = 0;
   int layerId = 0;
   int bs = 0;
@@ -101,17 +108,17 @@ struct BlockLayerParam {
   std::unique_ptr<OneRecMoEConfig> moe_config = nullptr;
 };
 
-atb::Status BlockLayer(const BlockLayerParam& param,
-                       atb::Operation** operation);
+atb::Status BlockLayer(const BlockLayerParam &param,
+                       atb::Operation **operation);
 
 // Function declarations for encoder and decoder self-attention
-int64_t AddEncoderSelfAttention(atb::Node& selfAttentionNode,
-                                const BlockLayerParam& param,
-                                std::map<std::string, uint32_t>& tensorMap);
-int64_t AddDecoderSelfAttention(atb::Node& selfAttentionNode,
-                                const BlockLayerParam& param,
-                                std::map<std::string, uint32_t>& tensorMap);
+int64_t AddEncoderSelfAttention(atb::Node &selfAttentionNode,
+                                const BlockLayerParam &param,
+                                std::map<std::string, uint32_t> &tensorMap);
+int64_t AddDecoderSelfAttention(atb::Node &selfAttentionNode,
+                                const BlockLayerParam &param,
+                                std::map<std::string, uint32_t> &tensorMap);
 
-}  // namespace onerec
-}  // namespace atb_speed
-#endif  // ATB_SPEED_MODELS_ONEREC_BLOCK_LAYER_H
+} // namespace onerec
+} // namespace atb_speed
+#endif // ATB_SPEED_MODELS_ONEREC_BLOCK_LAYER_H
