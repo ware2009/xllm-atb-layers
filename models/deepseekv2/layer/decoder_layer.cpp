@@ -933,7 +933,9 @@ int64_t SetMlpExpert(atb::GraphParam &opGraph, const DecoderLayerParam &param,
     mlpExpertParam.mlpLinearTransposeType = param.mlpLinearTransposeType;
     mlpExpertParam.packQuantType = param.packQuantType.at(1);
     mlpExpertParam.quantGroupSize = param.quantGroupSize;
-    mlpExpertParam.enableSwiGLUQuantForSharedExperts = param.enableSwiGLUQuantForSharedExperts;
+    // Dense MLP reuses SharedExpertOperation, but this flag is only valid for
+    // the MoE shared expert path.
+    mlpExpertParam.enableSwiGLUQuantForSharedExperts = false;
     atb_speed::common::CreateSharedExpertOperation(mlpExpertParam, &mlpExpertNode.operation);
     std::string tmp = is_auxiliary ? "intermediate_selfattention_norm_out_auxiliary" :  "intermediate_selfattention_norm_out";
     std::vector<std::string> mlpExpertInTensorNames = {tmp, 
