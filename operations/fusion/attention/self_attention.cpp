@@ -45,7 +45,10 @@ int64_t AddSelfAttention(atb::GraphParam &opGraph,
        << std::endl;
   }
   ATB_SPEED_LOG_DEBUG("layer map tensor:\n" << ss.str());
-  if (!param.enableRopeQuantKvcache && param.needUpdateKVCache) {
+  const bool shouldSkipOneRecCrossPrefillCacheUpdate =
+      param.isOneRecCrossAttention && param.isPrefill;
+  if (!param.enableRopeQuantKvcache && param.needUpdateKVCache &&
+      !shouldSkipOneRecCrossPrefillCacheUpdate) {
     if (!param.isFA) { // Paged Attention path
       if (param.enableXattention && !param.isPrefill) {
         // Decode phase for unified decode-kv-cache pipeline.
@@ -817,6 +820,16 @@ ResolvePerRankKvHeadNum(const FusionAttentionParam<NormParamType> &param) {
   return 0;
 }
 
+int64_t ValidateRequiredTensor(
+    const std::map<std::string, uint32_t> &tensorMap, const char *tensorName,
+    const char *caller) {
+  if (tensorMap.find(tensorName) == tensorMap.end()) {
+    ATB_SPEED_LOG_ERROR(caller << " missing required tensor: " << tensorName);
+    return atb::ERROR_INVALID_PARAM;
+  }
+  return atb::NO_ERROR;
+}
+
 template <typename NormParamType>
 int64_t
 ValidatePerRankKvLayout(const FusionAttentionParam<NormParamType> &param,
@@ -845,6 +858,24 @@ int64_t ConstructOneRecCrossFusedInferAttentionNode(
     std::map<std::string, uint32_t> &tensorMap) {
   CHECK_OPERATION_STATUS_RETURN(ValidatePerRankKvLayout(
       param, "ConstructOneRecCrossFusedInferAttentionNode"));
+  CHECK_OPERATION_STATUS_RETURN(ValidateRequiredTensor(
+      tensorMap, "intermediate_q",
+      "ConstructOneRecCrossFusedInferAttentionNode"));
+  CHECK_OPERATION_STATUS_RETURN(ValidateRequiredTensor(
+      tensorMap, "in_cross_k_cache",
+      "ConstructOneRecCrossFusedInferAttentionNode"));
+  CHECK_OPERATION_STATUS_RETURN(ValidateRequiredTensor(
+      tensorMap, "in_cross_v_cache",
+      "ConstructOneRecCrossFusedInferAttentionNode"));
+  CHECK_OPERATION_STATUS_RETURN(ValidateRequiredTensor(
+      tensorMap, "cross_kv_len",
+      "ConstructOneRecCrossFusedInferAttentionNode"));
+  ATB_SPEED_LOG_ERROR(
+      "OneRecCrossAttention ConstructOneRecCrossFusedInferAttentionNode: "
+      << "isOneRecCrossAttention=" << param.isOneRecCrossAttention
+      << ", isPrefill=" << param.isPrefill
+      << ", enableXattention=" << param.enableXattention
+      << ", consume_k=in_cross_k_cache, consume_v=in_cross_v_cache");
   selfAttentionNode.inTensorIds = {
       GetTensorIdx(tensorMap, "intermediate_q"),
       GetTensorIdx(tensorMap, "in_cross_k_cache"),

@@ -103,6 +103,7 @@ struct BlockLayerParam {
   bool enableOneRecPrefillOnly = false;
   bool emptyCrossAttn = true;
   bool use_moe = false;
+  bool use_xattn = false;
 
   // OneRec MoE configuration (only valid when use_moe is true)
   std::unique_ptr<OneRecMoEConfig> moe_config = nullptr;

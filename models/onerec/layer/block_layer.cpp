@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <string>
@@ -31,6 +32,41 @@
 
 namespace atb_speed {
 namespace onerec {
+
+namespace {
+
+bool EffectiveCrossAttentionIsPrefill(const BlockLayerParam &param) {
+  const bool use_prefill_only =
+      param.enableOneRecPrefillOnly && !param.use_xattn;
+  return param.isPrefill && !(use_prefill_only && !param.emptyCrossAttn);
+}
+
+bool DebugStopAfterCrossForLayer0(const BlockLayerParam &param) {
+  const char *flag = std::getenv("XLLM_DEBUG_ONEREC_LAYER0_STOP_AFTER_CROSS");
+  if (flag == nullptr || std::string(flag) != "1") {
+    return false;
+  }
+  return param.isDecoder && param.isPrefill && param.layerId == 0;
+}
+
+bool DebugStopAfterSelfForLayer0(const BlockLayerParam &param) {
+  const char *flag = std::getenv("XLLM_DEBUG_ONEREC_LAYER0_STOP_AFTER_SELF");
+  if (flag == nullptr || std::string(flag) != "1") {
+    return false;
+  }
+  return param.isDecoder && param.isPrefill && param.layerId == 0;
+}
+
+bool DebugStopAfterCrossAttnForLayer0(const BlockLayerParam &param) {
+  const char *flag =
+      std::getenv("XLLM_DEBUG_ONEREC_LAYER0_STOP_AFTER_CROSS_ATTN");
+  if (flag == nullptr || std::string(flag) != "1") {
+    return false;
+  }
+  return param.isDecoder && param.isPrefill && param.layerId == 0;
+}
+
+} // namespace
 
 std::map<std::string, std::vector<std::string>>
 GetOneRecLayerInTensorCandidates() {
@@ -149,7 +185,10 @@ GetOneRecLayerInTensorCandidates() {
             "in_dense_lora_b"}},
           {"lora_mlp",
            {"in_mlp_lora_a_0", "in_mlp_lora_b_0", "in_mlp_lora_a_1",
-            "in_mlp_lora_b_1", "in_mlp_down_lora_a", "in_mlp_down_lora_b"}}};
+            "in_mlp_lora_b_1", "in_mlp_down_lora_a", "in_mlp_down_lora_b"}},
+          {"decode_kv_cache",
+           {"in_decode_k_cache", "in_decode_v_cache", "in_beam_width",
+            "in_current_round"}}};
   return oneRecLayerInTensorCandidates;
 }
 
@@ -179,6 +218,9 @@ ConstructTensorMap(const BlockLayerParam &param, uint32_t &inTensorNum,
   auto oneRecLayerInTensorCandidates = GetOneRecLayerInTensorCandidates();
   auto oneRecLayerIntermediateTensorCandidates =
       GetOneRecLayerIntermediateTensorCandidates();
+  const bool stop_after_self = DebugStopAfterSelfForLayer0(param);
+  const bool stop_after_cross_attn = DebugStopAfterCrossAttnForLayer0(param);
+  const bool stop_after_cross = DebugStopAfterCrossForLayer0(param);
 
   std::vector<std::string> inTensorList = {};
   std::vector<std::string> intermediateTensorList = {};
@@ -222,8 +264,11 @@ ConstructTensorMap(const BlockLayerParam &param, uint32_t &inTensorNum,
   // Add OneRec decoder cross-attention related tensors
   // use_moe forces decoder mode
   if (param.isDecoder) {
-    if (param.enableOneRecPrefillOnly && !param.enableSplitFuse &&
-        !param.isFA) {
+    const bool use_prefill_only =
+        param.enableOneRecPrefillOnly && !param.use_xattn;
+    const bool effective_cross_attn_is_prefill =
+        EffectiveCrossAttentionIsPrefill(param);
+    if (use_prefill_only && !param.enableSplitFuse && !param.isFA) {
       // In OneRec prefill-only + ACLNN FIA path, cross-attn does not consume
       // in_cross_attn_seq_len / in_cross_attn_block_tables /
       // in_cross_attn_slots. Only keep cross_kv_len for the bs probe node.
@@ -232,37 +277,55 @@ ConstructTensorMap(const BlockLayerParam &param, uint32_t &inTensorNum,
       atb_speed::common::AddTensorToList(oneRecLayerInTensorCandidates,
                                          "cross_attn", inTensorList);
     }
+    if (param.use_xattn) {
+      atb_speed::common::AddTensorToList(oneRecLayerInTensorCandidates,
+                                         "decode_kv_cache", inTensorList);
+    }
     // In enableOneRecPrefillOnly + first prefill (emptyCrossAttn=true),
     // cross-attn generates K/V cache. ATB graph forbids writing to graph
     // inputs, so we must treat cross-attn KV cache as graph outputs.
-    const bool is_first_cross_attn_prefill = param.enableOneRecPrefillOnly &&
-                                             param.isPrefill &&
-                                             param.emptyCrossAttn;
-    if (is_first_cross_attn_prefill) {
+    const bool expose_cross_attn_kv_cache_as_output =
+        effective_cross_attn_is_prefill;
+    if (expose_cross_attn_kv_cache_as_output) {
       atb_speed::common::AddTensorToList(oneRecLayerInTensorCandidates,
                                          "cross_attn_kv_cache", outTensorList);
     } else {
       atb_speed::common::AddTensorToList(oneRecLayerInTensorCandidates,
                                          "cross_attn_kv_cache", inTensorList);
     }
-    atb_speed::common::AddTensorToList(oneRecLayerIntermediateTensorCandidates,
-                                       "decoder", intermediateTensorList);
+    if (stop_after_cross_attn) {
+      intermediateTensorList.push_back("intermediate_cross_attn_out");
+    } else if (!stop_after_self) {
+      atb_speed::common::AddTensorToList(
+          oneRecLayerIntermediateTensorCandidates, "decoder",
+          intermediateTensorList);
+    }
   }
   if (param.use_moe) {
-    atb_speed::common::AddTensorToList(oneRecLayerIntermediateTensorCandidates,
-                                       "moe_weight", intermediateTensorList);
-    atb_speed::common::AddTensorToList(oneRecLayerIntermediateTensorCandidates,
-                                       "moe_input_norm",
-                                       intermediateTensorList);
+    if (!stop_after_self && !stop_after_cross_attn && !stop_after_cross) {
+      atb_speed::common::AddTensorToList(
+          oneRecLayerIntermediateTensorCandidates, "moe_weight",
+          intermediateTensorList);
+    }
+    if (!stop_after_self && !stop_after_cross_attn) {
+      atb_speed::common::AddTensorToList(
+          oneRecLayerIntermediateTensorCandidates, "moe_input_norm",
+          intermediateTensorList);
+    }
     // Add shared expert tensors if enabled
-    if (param.moe_config && param.moe_config->moe_use_shared_experts) {
+    if (!stop_after_self && !stop_after_cross_attn && !stop_after_cross &&
+        param.moe_config &&
+        param.moe_config->moe_use_shared_experts) {
       atb_speed::common::AddTensorToList(
           oneRecLayerIntermediateTensorCandidates, "shared_expert",
           intermediateTensorList);
     }
   } else {
-    atb_speed::common::AddTensorToList(oneRecLayerIntermediateTensorCandidates,
-                                       "mlp_weight", intermediateTensorList);
+    if (!stop_after_self && !stop_after_cross_attn && !stop_after_cross) {
+      atb_speed::common::AddTensorToList(
+          oneRecLayerIntermediateTensorCandidates, "mlp_weight",
+          intermediateTensorList);
+    }
   }
 
   // Add parallel decoding feature or SplitFuse tensors
@@ -319,6 +382,7 @@ void SetSelfAttentionParamPart(
   fusionAttentionParam.isOneRecDecoder = param.isDecoder;
   *fusionAttentionParam.bs = param.bs;
   fusionAttentionParam.splitWithStride = false;
+  fusionAttentionParam.enableXattention = param.isDecoder && param.use_xattn;
 
   // OneRec uses RMSNorm
   atb::infer::RmsNormParam attenRmsNormParam;
@@ -346,7 +410,7 @@ void SetSelfAttentionParamPart(
   // - OneRec Decoder self-attention: true (always update for autoregressive
   // generation)
   fusionAttentionParam.needUpdateKVCache = param.isDecoder;
-  if (param.enableOneRecPrefillOnly) {
+  if (param.enableOneRecPrefillOnly && !param.use_xattn) {
     fusionAttentionParam.needUpdateKVCache = false;
   }
 
@@ -361,11 +425,10 @@ void SetSelfAttentionParam(
         &fusionAttentionParam,
     const BlockLayerParam &param) {
   SetSelfAttentionParamPart(fusionAttentionParam, param);
-  // Keep consistent with A3: PA prefill may construct FlashAttnScoreOperation
-  // which has 4 outputs (attn_out + 3 softmax stats). Output binding in the
-  // graph builder depends on attnBackend==ACLNN, so we must explicitly set the
-  // backend here to avoid output arity mismatch at runtime.
-  fusionAttentionParam.attnBackend = atb_speed::common::OpBackend::ACLNN;
+  fusionAttentionParam.attnBackend =
+      (param.isDecoder && param.use_xattn)
+          ? atb_speed::common::OpBackend::ATB
+          : atb_speed::common::OpBackend::ACLNN;
   fusionAttentionParam.matmulBackend = param.matmulBackend;
   fusionAttentionParam.isFA = param.isFA;
   fusionAttentionParam.isPrefill = param.isPrefill;
@@ -472,7 +535,7 @@ void SetCrossAttentionParam(
   fusionAttentionParam.attnBackend = atb_speed::common::OpBackend::ACLNN;
   fusionAttentionParam.matmulBackend = param.matmulBackend;
   fusionAttentionParam.isFA = param.isFA;
-  fusionAttentionParam.isPrefill = param.isPrefill;
+  fusionAttentionParam.isPrefill = EffectiveCrossAttentionIsPrefill(param);
   fusionAttentionParam.enableSplitFuse = param.enableSplitFuse;
   fusionAttentionParam.headDim = param.hiddenSizePerAttentionHead;
   fusionAttentionParam.selfAttentionParam.headNum =
@@ -493,7 +556,18 @@ void SetCrossAttentionParam(
 
   fusionAttentionParam.isOneRecEncoder = false;
   fusionAttentionParam.isOneRecCrossAttention = true;
-  fusionAttentionParam.enableOneRecPrefillOnly = param.enableOneRecPrefillOnly;
+  fusionAttentionParam.enableXattention = false;
+  fusionAttentionParam.enableOneRecPrefillOnly =
+      param.enableOneRecPrefillOnly && !param.use_xattn;
+  ATB_SPEED_LOG_ERROR(
+      "OneRecCrossAttention SetCrossAttentionParam: use_xattn="
+      << param.use_xattn << ", isPrefill=" << param.isPrefill
+      << ", effectiveIsPrefill=" << fusionAttentionParam.isPrefill
+      << ", enableXattention=" << fusionAttentionParam.enableXattention
+      << ", enableOneRecPrefillOnly="
+      << fusionAttentionParam.enableOneRecPrefillOnly
+      << ", needUpdateKVCache(pre)="
+      << fusionAttentionParam.needUpdateKVCache);
   // Plan D (intra-layer): in the MoE decoder path, fuse the self-attn residual
   // add with the next cross-attn Q RMSNorm inside CrossAttention (expose
   // `out_add` to replace the standalone Add op).
@@ -530,22 +604,16 @@ void SetCrossAttentionParam(
   // - OneRec Decoder Prefill: true (update K/V cache with encoder output)
   // - OneRec Decoder Decode: false (use existing K/V cache, no update
   // needed)
-  bool is_oneRec_prefill = param.isPrefill;
-  // OneRec cross-attention: update KV cache only during prefill stage
-  // During decode stage, reuse the encoder output KV cache from prefill
-  // Special case: if enableOneRecPrefillOnly is true and emptyCrossAttn is
-  // false, don't update KV cache (subsequent prefill)
-  if (param.enableOneRecPrefillOnly) {
+  const bool effective_cross_attn_is_prefill =
+      EffectiveCrossAttentionIsPrefill(param);
+  if (fusionAttentionParam.enableOneRecPrefillOnly) {
     fusionAttentionParam.needUpdateKVCache = false;
   } else {
-    fusionAttentionParam.needUpdateKVCache = is_oneRec_prefill;
+    fusionAttentionParam.needUpdateKVCache = effective_cross_attn_is_prefill;
   }
 
   // Subsequent prefill steps in prefill-only mode reuse the existing cross
   // K/V cache and must follow the decode path.
-  if (param.enableOneRecPrefillOnly && !param.emptyCrossAttn) {
-    fusionAttentionParam.isPrefill = false;
-  }
 
   fusionAttentionParam.selfOutLinearTensorParallelInfo = {
       param.rank, param.worldSize, param.backend};
@@ -617,6 +685,12 @@ int64_t AddEncoderSelfAttention(atb::Node &selfAttentionNode,
 
   if (param.enableLogN) {
     selfAttnInTensorNames.push_back("kv_cache_idx");
+  }
+  if (fusionAttentionParam.enableXattention) {
+    selfAttnInTensorNames.push_back("in_decode_k_cache");
+    selfAttnInTensorNames.push_back("in_decode_v_cache");
+    selfAttnInTensorNames.push_back("in_beam_width");
+    selfAttnInTensorNames.push_back("in_current_round");
   }
 
   selfAttentionNode.inTensorIds =
@@ -699,6 +773,12 @@ int64_t AddDecoderSelfAttention(atb::Node &selfAttentionNode,
   if (param.enableLogN) {
     selfAttnInTensorNames.push_back("kv_cache_idx");
   }
+  if (fusionAttentionParam.enableXattention) {
+    selfAttnInTensorNames.push_back("in_decode_k_cache");
+    selfAttnInTensorNames.push_back("in_decode_v_cache");
+    selfAttnInTensorNames.push_back("in_beam_width");
+    selfAttnInTensorNames.push_back("in_current_round");
+  }
 
   selfAttentionNode.inTensorIds =
       atb_speed::common::GetTensorIdxList(tensorMap, selfAttnInTensorNames);
@@ -759,12 +839,10 @@ int64_t AddCrossAttention(atb::Node &crossAttentionNode,
   // emptyCrossAttn. In enableOneRecPrefillOnly mode:
   // - emptyCrossAttn=true (first prefill): use prefill path
   // - emptyCrossAttn=false (subsequent steps): use decode path
-  bool crossAttnIsPrefill = param.isPrefill;
-  if (param.enableOneRecPrefillOnly && !param.emptyCrossAttn) {
-    crossAttnIsPrefill = false;
-  }
+  const bool crossAttnIsPrefill = EffectiveCrossAttentionIsPrefill(param);
   const bool minimizeOneRecCrossAttnInputs =
-      param.enableOneRecPrefillOnly && !param.enableSplitFuse && !param.isFA;
+      param.enableOneRecPrefillOnly && !param.use_xattn &&
+      !param.enableSplitFuse && !param.isFA;
 
   if (crossAttnIsPrefill) {
     // Prefill stage: compute cross K/V from encoder output. In prefill-only
@@ -1226,6 +1304,7 @@ atb::Status BlockLayer(const BlockLayerParam &param,
   atb::Node sharedExpertNode;
   atb::Node sharedExpertAddNode;
   atb::Node mlpResidualAddNode;
+  atb::Node debugOutNode;
 
   // Self-attention
   if (param.isDecoder) {
@@ -1254,11 +1333,54 @@ atb::Status BlockLayer(const BlockLayerParam &param,
     opGraph.nodes.push_back(selfResidualAddNode);
   }
 
+  if (DebugStopAfterSelfForLayer0(param)) {
+    atb::infer::ElewiseParam castParam;
+    castParam.elewiseType = atb::infer::ElewiseParam::ElewiseType::ELEWISE_MULS;
+    castParam.mulsParam.varAttr = 1.0f;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(castParam, &debugOutNode.operation));
+    debugOutNode.inTensorIds = atb_speed::common::GetTensorIdxList(
+        tensorMap, {"intermediate_self_residual_out"});
+    debugOutNode.outTensorIds =
+        atb_speed::common::GetTensorIdxList(tensorMap, {"out"});
+    opGraph.nodes.push_back(debugOutNode);
+    opGraph.inferShapeFunc =
+        [](const atb::SVector<atb::TensorDesc> &inTensorDescs,
+           atb::SVector<atb::TensorDesc> &outTensorDescs) {
+          outTensorDescs.at(0) = inTensorDescs.at(0);
+          return atb::NO_ERROR;
+        };
+    ATB_SPEED_LOG_ERROR("OneRec debug: stop layer0 after self-attn residual stage.");
+    return atb::CreateOperation(opGraph, operation);
+  }
+
   // Cross-attention (for decoder only)
   if (param.isDecoder) {
     CHECK_OPERATION_STATUS_RETURN(
         AddCrossAttention(crossAttentionNode, param, tensorMap));
     opGraph.nodes.push_back(crossAttentionNode);
+
+    if (DebugStopAfterCrossAttnForLayer0(param)) {
+      atb::infer::ElewiseParam castParam;
+      castParam.elewiseType = atb::infer::ElewiseParam::ElewiseType::ELEWISE_MULS;
+      castParam.mulsParam.varAttr = 1.0f;
+      CHECK_OPERATION_STATUS_RETURN(
+          atb::CreateOperation(castParam, &debugOutNode.operation));
+      debugOutNode.inTensorIds = atb_speed::common::GetTensorIdxList(
+          tensorMap, {"intermediate_cross_attn_out"});
+      debugOutNode.outTensorIds =
+          atb_speed::common::GetTensorIdxList(tensorMap, {"out"});
+      opGraph.nodes.push_back(debugOutNode);
+      opGraph.inferShapeFunc =
+          [](const atb::SVector<atb::TensorDesc> &inTensorDescs,
+             atb::SVector<atb::TensorDesc> &outTensorDescs) {
+            outTensorDescs.at(0) = inTensorDescs.at(0);
+            return atb::NO_ERROR;
+          };
+      ATB_SPEED_LOG_ERROR(
+          "OneRec debug: stop layer0 after cross-attn runner stage.");
+      return atb::CreateOperation(opGraph, operation);
+    }
 
     if (param.use_moe) {
       // Fuse cross-attention residual add + RMSNorm for MoE input.
@@ -1275,6 +1397,29 @@ atb::Status BlockLayer(const BlockLayerParam &param,
       crossResidualAddNode.outTensorIds = atb_speed::common::GetTensorIdxList(
           tensorMap, {"intermediate_cross_residual_out"});
       opGraph.nodes.push_back(crossResidualAddNode);
+    }
+
+    if (DebugStopAfterCrossForLayer0(param)) {
+      atb::infer::ElewiseParam castParam;
+      castParam.elewiseType =
+          atb::infer::ElewiseParam::ElewiseType::ELEWISE_MULS;
+      castParam.mulsParam.varAttr = 1.0f;
+      CHECK_OPERATION_STATUS_RETURN(
+          atb::CreateOperation(castParam, &debugOutNode.operation));
+      debugOutNode.inTensorIds = atb_speed::common::GetTensorIdxList(
+          tensorMap, {"intermediate_cross_residual_out"});
+      debugOutNode.outTensorIds =
+          atb_speed::common::GetTensorIdxList(tensorMap, {"out"});
+      opGraph.nodes.push_back(debugOutNode);
+      opGraph.inferShapeFunc =
+          [](const atb::SVector<atb::TensorDesc> &inTensorDescs,
+             atb::SVector<atb::TensorDesc> &outTensorDescs) {
+            outTensorDescs.at(0) = inTensorDescs.at(0);
+            return atb::NO_ERROR;
+          };
+      ATB_SPEED_LOG_ERROR(
+          "OneRec debug: stop layer0 after cross-attn residual stage.");
+      return atb::CreateOperation(opGraph, operation);
     }
   }
 

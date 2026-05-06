@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "operations/fusion/attention/fusion_attention.h"
+#include <cstdlib>
 #include "atb_speed/log.h"
 #include "atb_speed/utils/check_util.h"
 #include "operations/aclnn/ops/add_rms_norm_operation.h"
@@ -26,6 +27,76 @@
 
 namespace atb_speed {
 namespace common {
+
+namespace {
+
+template <typename NormParamType>
+bool DebugStopOneRecCrossLayer0AfterQkv(
+    const FusionAttentionParam<NormParamType> &param) {
+  const char *flag =
+      std::getenv("XLLM_DEBUG_ONEREC_CROSS_LAYER0_STOP_AFTER_QKV");
+  if (flag == nullptr || std::string(flag) != "1") {
+    return false;
+  }
+  return param.isOneRecCrossAttention && param.isPrefill && param.layerId == 0;
+}
+
+template <typename NormParamType>
+bool DebugStopOneRecCrossLayer0AfterKvOnly(
+    const FusionAttentionParam<NormParamType> &param) {
+  const char *flag =
+      std::getenv("XLLM_DEBUG_ONEREC_CROSS_LAYER0_STOP_AFTER_KV_ONLY");
+  if (flag == nullptr || std::string(flag) != "1") {
+    return false;
+  }
+  return param.isOneRecCrossAttention && param.isPrefill && param.layerId == 0;
+}
+
+template <typename NormParamType>
+bool DebugStopOneRecCrossLayer0AfterKOnly(
+    const FusionAttentionParam<NormParamType> &param) {
+  const char *flag =
+      std::getenv("XLLM_DEBUG_ONEREC_CROSS_LAYER0_STOP_AFTER_K_ONLY");
+  if (flag == nullptr || std::string(flag) != "1") {
+    return false;
+  }
+  return param.isOneRecCrossAttention && param.isPrefill && param.layerId == 0;
+}
+
+template <typename NormParamType>
+bool DebugStopOneRecCrossLayer0WithIdentityK(
+    const FusionAttentionParam<NormParamType> &param) {
+  const char *flag =
+      std::getenv("XLLM_DEBUG_ONEREC_CROSS_LAYER0_STOP_WITH_IDENTITY_K");
+  if (flag == nullptr || std::string(flag) != "1") {
+    return false;
+  }
+  return param.isOneRecCrossAttention && param.isPrefill && param.layerId == 0;
+}
+
+template <typename NormParamType>
+bool DebugStopOneRecCrossLayer0WithIdentityV(
+    const FusionAttentionParam<NormParamType> &param) {
+  const char *flag =
+      std::getenv("XLLM_DEBUG_ONEREC_CROSS_LAYER0_STOP_WITH_IDENTITY_V");
+  if (flag == nullptr || std::string(flag) != "1") {
+    return false;
+  }
+  return param.isOneRecCrossAttention && param.isPrefill && param.layerId == 0;
+}
+
+template <typename NormParamType>
+bool DebugStopOneRecCrossLayer0WithIdentityKv(
+    const FusionAttentionParam<NormParamType> &param) {
+  const char *flag =
+      std::getenv("XLLM_DEBUG_ONEREC_CROSS_LAYER0_STOP_WITH_IDENTITY_KV");
+  if (flag == nullptr || std::string(flag) != "1") {
+    return false;
+  }
+  return param.isOneRecCrossAttention && param.isPrefill && param.layerId == 0;
+}
+
+} // namespace
 
 std::map<std::string, std::vector<std::string>> GetAttnInTensorCandidates();
 std::map<std::string, std::vector<std::string>>
@@ -115,7 +186,8 @@ ConstructOneRecTensorMap(const FusionAttentionParam<NormParamType> &param,
   auto attnInTensorCandidates = GetAttnInTensorCandidates();
   std::map<std::string, std::vector<std::string>>
       attnIntermediateTensorCandidates;
-  if (param.isPrefill && param.enableXattention) {
+  if (param.isPrefill && param.enableXattention &&
+      !param.isOneRecCrossAttention) {
     attnIntermediateTensorCandidates =
         GetAttnIntermediateTensorCandidatesPrefill();
   } else {
@@ -132,8 +204,13 @@ ConstructOneRecTensorMap(const FusionAttentionParam<NormParamType> &param,
   }
   AddTensorToList(attnIntermediateTensorCandidates, "default",
                   intermediateTensorList);
-  // OneRec FAS needs intermediate mask tensor for seqlen extraction
-  if (param.attnBackend == atb_speed::common::OpBackend::ACLNN) {
+  // OneRec decoder FAS needs intermediate mask tensor and softmax stats.
+  const bool useOneRecDecoderFAS =
+      param.isOneRecDecoder &&
+      param.attnBackend == atb_speed::common::OpBackend::ACLNN &&
+      param.aclnnFAScoreParam.headNum > 0 &&
+      !(param.isPrefill && param.enableXattention);
+  if (useOneRecDecoderFAS) {
     intermediateTensorList.push_back("intermediate_mask");
     intermediateTensorList.push_back("softmax_max_out");
     intermediateTensorList.push_back("softmax_sum_out");
@@ -223,6 +300,15 @@ std::map<std::string, uint32_t> ConstructOneRecCrossAttentionTensorMap(
   auto attnIntermediateTensorCandidates = GetAttnIntermediateTensorCandidates();
   const bool isOneRecCrossPrefill =
       param.isPrefill && param.isOneRecCrossAttention;
+  const bool stop_after_qkv = DebugStopOneRecCrossLayer0AfterQkv(param);
+  const bool stop_after_kv_only = DebugStopOneRecCrossLayer0AfterKvOnly(param);
+  const bool stop_after_k_only = DebugStopOneRecCrossLayer0AfterKOnly(param);
+  const bool stop_with_identity_k =
+      DebugStopOneRecCrossLayer0WithIdentityK(param);
+  const bool stop_with_identity_v =
+      DebugStopOneRecCrossLayer0WithIdentityV(param);
+  const bool stop_with_identity_kv =
+      DebugStopOneRecCrossLayer0WithIdentityKv(param);
   const bool minimizeOneRecCrossAttnInputs =
       param.isOneRecCrossAttention &&
       param.attnBackend == atb_speed::common::OpBackend::ACLNN &&
@@ -303,18 +389,27 @@ std::map<std::string, uint32_t> ConstructOneRecCrossAttentionTensorMap(
   }
 
   std::vector<std::string> intermediateTensorList =
-      (!param.isPrefill || isOneRecCrossPrefill)
-          ? std::vector<std::string>{"intermediate_q",
-                                     "intermediate_self_attention"}
-          : std::vector<std::string>{"intermediate_q", "intermediate_k",
-                                     "intermediate_v",
-                                     "intermediate_self_attention"};
+      (stop_after_k_only || stop_after_kv_only || stop_with_identity_k ||
+       stop_with_identity_v || stop_with_identity_kv)
+          ? std::vector<std::string>{}
+          : stop_after_qkv
+          ? std::vector<std::string>{"intermediate_q"}
+          : ((!param.isPrefill || isOneRecCrossPrefill)
+                 ? std::vector<std::string>{"intermediate_q",
+                                            "intermediate_self_attention"}
+                 : std::vector<std::string>{"intermediate_q",
+                                            "intermediate_k",
+                                            "intermediate_v",
+                                            "intermediate_self_attention"});
   std::vector<std::string> outTensorList = {"out"};
 
   ConstructAttentionQuantTensorMap(param, attnInTensorCandidates,
                                    attnIntermediateTensorCandidates,
                                    inTensorList, intermediateTensorList);
-  if (param.attnBackend == atb_speed::common::OpBackend::ACLNN) {
+  if (param.attnBackend == atb_speed::common::OpBackend::ACLNN &&
+      !stop_after_qkv && !stop_after_kv_only && !stop_after_k_only &&
+      !stop_with_identity_k && !stop_with_identity_v &&
+      !stop_with_identity_kv) {
     // Align with xllm_rec: cross-attention only needs one lightweight
     // internal sink for the bs probe node. Reusing the full FIA intermediate
     // set here leaves unassigned tensors in the graph because the cross-attn
@@ -496,7 +591,8 @@ ConstructTensorMap(const FusionAttentionParam<NormParamType> &param,
   auto attnInTensorCandidates = GetAttnInTensorCandidates();
   std::map<std::string, std::vector<std::string>>
       attnIntermediateTensorCandidates;
-  if (param.isPrefill && param.enableXattention) {
+  if (param.isPrefill && param.enableXattention &&
+      !param.isOneRecCrossAttention) {
     attnIntermediateTensorCandidates =
         GetAttnIntermediateTensorCandidatesPrefill();
   } else {
@@ -675,13 +771,13 @@ AddFAttnQKVLinearSplitNode(const FusionAttentionParam<NormParamType> &param,
   qkvLinearSplitNode.inTensorIds =
       GetTensorIdxList(tensorMap, qkvInTensorNames);
   std::vector<std::string> qkvOutTensorNames;
-  if (param.isPrefill && param.enableXattention) {
+  if (param.isPrefill && param.enableXattention &&
+      !param.isOneRecCrossAttention) {
     qkvOutTensorNames = {"intermediate_q", "in_decode_k_cache",
                          "in_decode_v_cache"};
   } else {
     qkvOutTensorNames = {"intermediate_q", "intermediate_k", "intermediate_v"};
   }
-
   if (param.enableRopeQuantKvcache) { // 3 -> 1
     qkvOutTensorNames = {"intermediate_qkv_rope"};
   }
@@ -738,7 +834,8 @@ AddRopeQuantKvcacheOperation(atb::GraphParam &opGraph,
     dequantRopeQuantKvcacheNode.inTensorIds.push_back(
         GetTensorIdx(tensorMap, "in_bias_0")); // 12: bias
   }
-  if (param.isPrefill && param.enableXattention) {
+  if (param.isPrefill && param.enableXattention &&
+      !param.isOneRecCrossAttention) {
     dequantRopeQuantKvcacheNode.outTensorIds = {
         GetTensorIdx(tensorMap, "intermediate_q"),    // q_out // 1024, 8, 128
         GetTensorIdx(tensorMap, "in_decode_k_cache"), // k_out // 1024, 1, 128
@@ -770,7 +867,8 @@ atb::Status AddFAttnRopeNode(const FusionAttentionParam<NormParamType> &param,
   ropeParam.ropeParam = param.ropeParam;
 
   RotaryPositionEmbedding(ropeParam, &ropeNode.operation);
-  if (param.isPrefill && param.enableXattention) {
+  if (param.isPrefill && param.enableXattention &&
+      !param.isOneRecCrossAttention) {
     ropeNode.inTensorIds = {// [B,S,N,D] PA [BS,ND]
                             GetTensorIdx(tensorMap, "intermediate_q"),
                             GetTensorIdx(tensorMap, "in_decode_k_cache"),
@@ -791,7 +889,8 @@ atb::Status AddFAttnRopeNode(const FusionAttentionParam<NormParamType> &param,
     ropeNode.inTensorReshapeFuncs.at(0) = &SqueezeHeadNumHeadDim;
     ropeNode.inTensorReshapeFuncs.at(1) = &SqueezeHeadNumHeadDim;
   }
-  if (param.isPrefill && param.enableXattention) {
+  if (param.isPrefill && param.enableXattention &&
+      !param.isOneRecCrossAttention) {
     ropeNode.outTensorIds = {
         // FA [B,S,N,D] PA [BS,N,D]
         GetTensorIdx(tensorMap, "intermediate_q"),
@@ -819,7 +918,8 @@ AddKVValueQuantNode(const FusionAttentionParam<NormParamType> &param,
       atb::infer::ElewiseParam::ElewiseType::ELEWISE_QUANT_PER_CHANNEL;
   CREATE_OPERATION(kvValueQuantParam, &kvValueQuantNode.operation);
   if (isK) {
-    if (param.isPrefill && param.enableXattention) {
+    if (param.isPrefill && param.enableXattention &&
+      !param.isOneRecCrossAttention) {
       kvValueQuantNode.inTensorIds = {
           GetTensorIdx(tensorMap, "in_decode_k_cache"),
           GetTensorIdx(tensorMap, "in_k_quant_scale"),
@@ -835,7 +935,8 @@ AddKVValueQuantNode(const FusionAttentionParam<NormParamType> &param,
     kvValueQuantNode.outTensorIds = {
         GetTensorIdx(tensorMap, "intermediate_k_int8")};
   } else {
-    if (param.isPrefill && param.enableXattention) {
+    if (param.isPrefill && param.enableXattention &&
+      !param.isOneRecCrossAttention) {
       kvValueQuantNode.inTensorIds = {
           GetTensorIdx(tensorMap, "in_decode_v_cache"),
           GetTensorIdx(tensorMap, "in_v_quant_scale"),
@@ -884,7 +985,8 @@ atb::Status AddQKVQuantNode(const FusionAttentionParam<NormParamType> &param,
     qkvQuantNode.outTensorIds = {
         GetTensorIdx(tensorMap, "intermediate_q_int8")};
   } else if (nodeType == "K") {
-    if (param.isPrefill && param.enableXattention) {
+    if (param.isPrefill && param.enableXattention &&
+      !param.isOneRecCrossAttention) {
       qkvQuantNode.inTensorIds = {GetTensorIdx(tensorMap, "in_decode_k_cache"),
                                   GetTensorIdx(tensorMap, "in_k_quant_scale"),
                                   GetTensorIdx(tensorMap, "kv_offset")};
@@ -896,7 +998,8 @@ atb::Status AddQKVQuantNode(const FusionAttentionParam<NormParamType> &param,
     qkvQuantNode.outTensorIds = {
         GetTensorIdx(tensorMap, "intermediate_k_int8")};
   } else if (nodeType == "V") {
-    if (param.isPrefill && param.enableXattention) {
+    if (param.isPrefill && param.enableXattention &&
+      !param.isOneRecCrossAttention) {
       qkvQuantNode.inTensorIds = {
           GetTensorIdx(tensorMap, "in_decode_v_cache"),
           GetTensorIdx(tensorMap, "in_v_quant_scale"),
@@ -1117,210 +1220,229 @@ atb::Status
 AddCrossAttnQKVProjectionNodes(const FusionAttentionParam<NormParamType> &param,
                                atb::GraphParam &opGraph,
                                std::map<std::string, uint32_t> &tensorMap) {
+  const bool stop_with_identity_k =
+      DebugStopOneRecCrossLayer0WithIdentityK(param);
+  const bool stop_with_identity_v =
+      DebugStopOneRecCrossLayer0WithIdentityV(param);
+  const bool stop_with_identity_kv =
+      DebugStopOneRecCrossLayer0WithIdentityKv(param);
+  const bool stop_after_k_only = DebugStopOneRecCrossLayer0AfterKOnly(param);
+  const bool stop_after_kv_only = DebugStopOneRecCrossLayer0AfterKvOnly(param);
   if (param.isPrefill) {
-    atb::Node qProjectionNode;
-    atb_speed::common::NormLinearParam<NormParamType> qNormLinearParam;
-    qNormLinearParam.fusionLinearParam.quantType =
-        atb_speed::common::GetLinearQuantType(
-            param.packQuantType, param.layerLinearQuantType[Q_LINEAR_INDEX],
-            param.enableNormQuantOp, param.layerLinearDescs[Q_LINEAR_INDEX]);
-    qNormLinearParam.fusionLinearParam.hasBias = param.qkvHasBias;
-    qNormLinearParam.fusionLinearParam.isBF16 = param.isBF16;
-    qNormLinearParam.fusionLinearParam.supportLora = param.supportLora;
-    qNormLinearParam.fusionLinearParam.useImMask = param.useImMask;
-    qNormLinearParam.fusionLinearParam.loraEnableGMM = param.loraEnableGMM;
-    qNormLinearParam.fusionLinearParam.transposeType =
-        param.layerLinearTransposeType[Q_LINEAR_INDEX];
-    qNormLinearParam.fusionLinearParam.quantGroupSize = param.quantGroupSize;
-    qNormLinearParam.fusionLinearParam.isPrefill = param.isPrefill;
-    qNormLinearParam.fusionLinearParam.matmulBackend = param.matmulBackend;
-    qNormLinearParam.skipNorm = param.skipNorm;
-    qNormLinearParam.normHasBias = param.normHasBias;
-    qNormLinearParam.normParamType = param.normParamType;
-    qNormLinearParam.normQuantParamType = param.normQuantParamType;
+    if (!stop_after_kv_only && !stop_after_k_only && !stop_with_identity_k &&
+        !stop_with_identity_v && !stop_with_identity_kv) {
+      atb::Node qProjectionNode;
+      atb_speed::common::NormLinearParam<NormParamType> qNormLinearParam;
+      qNormLinearParam.fusionLinearParam.quantType =
+          atb_speed::common::GetLinearQuantType(
+              param.packQuantType, param.layerLinearQuantType[Q_LINEAR_INDEX],
+              param.enableNormQuantOp, param.layerLinearDescs[Q_LINEAR_INDEX]);
+      qNormLinearParam.fusionLinearParam.hasBias = param.qkvHasBias;
+      qNormLinearParam.fusionLinearParam.isBF16 = param.isBF16;
+      qNormLinearParam.fusionLinearParam.supportLora = param.supportLora;
+      qNormLinearParam.fusionLinearParam.useImMask = param.useImMask;
+      qNormLinearParam.fusionLinearParam.loraEnableGMM = param.loraEnableGMM;
+      qNormLinearParam.fusionLinearParam.transposeType =
+          param.layerLinearTransposeType[Q_LINEAR_INDEX];
+      qNormLinearParam.fusionLinearParam.quantGroupSize = param.quantGroupSize;
+      qNormLinearParam.fusionLinearParam.isPrefill = param.isPrefill;
+      qNormLinearParam.fusionLinearParam.matmulBackend = param.matmulBackend;
+      qNormLinearParam.skipNorm = param.skipNorm;
+      qNormLinearParam.normHasBias = param.normHasBias;
+      qNormLinearParam.normParamType = param.normParamType;
+      qNormLinearParam.normQuantParamType = param.normQuantParamType;
 
-    if (param.enableAddNorm && !param.skipNorm && !param.supportLora) {
-      atb::GraphParam qOpGraph;
-      qOpGraph.name = "CrossAttnQAddRmsNormLinear";
-      std::vector<std::string> qInTensorList = {
-          "in_input",         "in_residual_add", "in_norm_weight",
-          "in_linear_weight", "in_scale",        "in_offset",
-          "in_descale",       "in_bias",         "in_compress_idx",
-      };
-      std::vector<std::string> qOutTensorList = {"out_q", "out_add"};
-      std::vector<std::string> qIntermediateTensorList = {
-          "intermediate_norm",
-          "intermediate_rstd",
-      };
-      qOpGraph.inTensorNum = qInTensorList.size();
-      qOpGraph.outTensorNum = qOutTensorList.size();
-      qOpGraph.internalTensorNum = qIntermediateTensorList.size();
-      std::map<std::string, uint32_t> qTensorMap =
-          GetTensorMap(qInTensorList, qOutTensorList, qIntermediateTensorList);
+      if (param.enableAddNorm && !param.skipNorm && !param.supportLora) {
+        atb::GraphParam qOpGraph;
+        qOpGraph.name = "CrossAttnQAddRmsNormLinear";
+        std::vector<std::string> qInTensorList = {
+            "in_input",         "in_residual_add", "in_norm_weight",
+            "in_linear_weight", "in_scale",        "in_offset",
+            "in_descale",       "in_bias",         "in_compress_idx",
+        };
+        std::vector<std::string> qOutTensorList = {"out_q", "out_add"};
+        std::vector<std::string> qIntermediateTensorList = {
+            "intermediate_norm",
+            "intermediate_rstd",
+        };
+        qOpGraph.inTensorNum = qInTensorList.size();
+        qOpGraph.outTensorNum = qOutTensorList.size();
+        qOpGraph.internalTensorNum = qIntermediateTensorList.size();
+        std::map<std::string, uint32_t> qTensorMap =
+            GetTensorMap(qInTensorList, qOutTensorList, qIntermediateTensorList);
 
-      atb::Node addRmsNormNode;
-      addRmsNormNode.operation = new atb_speed::common::AddRmsNormOperation(
-          "AclnnCrossAttnQAddRmsNormNode",
-          param.normParamType.normParam.epsilon);
-      addRmsNormNode.inTensorIds = GetTensorIdxList(
-          qTensorMap, {"in_residual_add", "in_input", "in_norm_weight"});
-      addRmsNormNode.outTensorIds = GetTensorIdxList(
-          qTensorMap, {"intermediate_norm", "intermediate_rstd", "out_add"});
-      qOpGraph.nodes.push_back(addRmsNormNode);
+        atb::Node addRmsNormNode;
+        addRmsNormNode.operation = new atb_speed::common::AddRmsNormOperation(
+            "AclnnCrossAttnQAddRmsNormNode",
+            param.normParamType.normParam.epsilon);
+        addRmsNormNode.inTensorIds = GetTensorIdxList(
+            qTensorMap, {"in_residual_add", "in_input", "in_norm_weight"});
+        addRmsNormNode.outTensorIds = GetTensorIdxList(
+            qTensorMap, {"intermediate_norm", "intermediate_rstd", "out_add"});
+        qOpGraph.nodes.push_back(addRmsNormNode);
 
-      atb::Node linearNode;
-      atb_speed::common::FusionLinearParam linearParam =
-          qNormLinearParam.fusionLinearParam;
-      CHECK_OPERATION_STATUS_RETURN(
-          FusionLinear(linearParam, &linearNode.operation));
-      linearNode.inTensorIds =
-          GetTensorIdxList(qTensorMap, {"intermediate_norm", "in_linear_weight",
-                                        "in_scale", "in_offset", "in_descale",
-                                        "in_bias", "in_compress_idx"});
-      linearNode.outTensorIds = {GetTensorIdx(qTensorMap, "out_q")};
-      qOpGraph.nodes.push_back(linearNode);
+        atb::Node linearNode;
+        atb_speed::common::FusionLinearParam linearParam =
+            qNormLinearParam.fusionLinearParam;
+        CHECK_OPERATION_STATUS_RETURN(
+            FusionLinear(linearParam, &linearNode.operation));
+        linearNode.inTensorIds = GetTensorIdxList(
+            qTensorMap,
+            {"intermediate_norm", "in_linear_weight", "in_scale", "in_offset",
+             "in_descale", "in_bias", "in_compress_idx"});
+        linearNode.outTensorIds = {GetTensorIdx(qTensorMap, "out_q")};
+        qOpGraph.nodes.push_back(linearNode);
 
-      CHECK_OPERATION_STATUS_RETURN(
-          atb::CreateOperation(qOpGraph, &qProjectionNode.operation));
+        CHECK_OPERATION_STATUS_RETURN(
+            atb::CreateOperation(qOpGraph, &qProjectionNode.operation));
 
-      std::vector<std::string> qInTensor = {
-          "intermediate_self_residual_out",
-          "in_residual_add",
-          "in_cross_attn_norm_weight",
-          "in_cross_weight_0",
-          "in_cross_scale_0",
-          "in_cross_offset_0",
-          "in_cross_descale_0",
-          "in_cross_bias_0",
-          "in_cross_compress_idx_0",
-      };
-      qProjectionNode.inTensorIds = GetTensorIdxList(tensorMap, qInTensor);
-      qProjectionNode.outTensorIds =
-          GetTensorIdxList(tensorMap, {"intermediate_q", "out_add"});
-    } else {
-      CHECK_OPERATION_STATUS_RETURN(
-          atb_speed::common::NormLinear<NormParamType>(
-              qNormLinearParam, &qProjectionNode.operation));
-      std::vector<std::string> qInTensor = {
-          "intermediate_self_residual_out",
+        std::vector<std::string> qInTensor = {
+            "intermediate_self_residual_out",
+            "in_residual_add",
+            "in_cross_attn_norm_weight",
+            "in_cross_weight_0",
+            "in_cross_scale_0",
+            "in_cross_offset_0",
+            "in_cross_descale_0",
+            "in_cross_bias_0",
+            "in_cross_compress_idx_0",
+        };
+        qProjectionNode.inTensorIds = GetTensorIdxList(tensorMap, qInTensor);
+        qProjectionNode.outTensorIds =
+            GetTensorIdxList(tensorMap, {"intermediate_q", "out_add"});
+      } else {
+        CHECK_OPERATION_STATUS_RETURN(
+            atb_speed::common::NormLinear<NormParamType>(
+                qNormLinearParam, &qProjectionNode.operation));
+        std::vector<std::string> qInTensor = {
+            "intermediate_self_residual_out",
+            "in_cross_attn_norm_weight",
+            "in_cross_attn_norm_bias",
+            "in_cross_attn_norm_new_weight",
+            "in_cross_attn_norm_new_bias",
+            "in_cross_weight_0",
+            "in_cross_bias_0",
+            "in_cross_descale_0",
+            "in_cross_offset_0",
+            "in_cross_scale_0",
+            "in_cross_compress_idx_0",
+        };
+        if (param.supportLora) {
+          if (param.useImMask) {
+            qInTensor.push_back("in_im_mask");
+          }
+          qInTensor.push_back("in_seq_len_cum_sum");
+          qInTensor.push_back("in_lora_a_0");
+          qInTensor.push_back("in_lora_b_0");
+        }
+        qProjectionNode.inTensorIds = GetTensorIdxList(tensorMap, qInTensor);
+        qProjectionNode.outTensorIds = {
+            GetTensorIdx(tensorMap, "intermediate_q")};
+      }
+      opGraph.nodes.push_back(qProjectionNode);
+    }
+
+    if (!stop_with_identity_k && !stop_with_identity_kv) {
+      atb::Node kProjectionNode;
+      atb_speed::common::NormLinearParam<NormParamType> kNormLinearParam;
+      kNormLinearParam.fusionLinearParam.quantType =
+          atb_speed::common::GetLinearQuantType(
+              param.packQuantType, param.layerLinearQuantType[K_LINEAR_INDEX],
+              param.enableNormQuantOp, param.layerLinearDescs[K_LINEAR_INDEX]);
+      kNormLinearParam.fusionLinearParam.hasBias = param.qkvHasBias;
+      kNormLinearParam.fusionLinearParam.isBF16 = param.isBF16;
+      kNormLinearParam.fusionLinearParam.supportLora = param.supportLora;
+      kNormLinearParam.fusionLinearParam.useImMask = param.useImMask;
+      kNormLinearParam.fusionLinearParam.loraEnableGMM = param.loraEnableGMM;
+      kNormLinearParam.fusionLinearParam.transposeType = 1;
+      kNormLinearParam.fusionLinearParam.quantGroupSize = param.quantGroupSize;
+      kNormLinearParam.fusionLinearParam.isPrefill = param.isPrefill;
+      kNormLinearParam.fusionLinearParam.matmulBackend = param.matmulBackend;
+      kNormLinearParam.skipNorm = true;
+      kNormLinearParam.normHasBias = param.normHasBias;
+      kNormLinearParam.normParamType = param.normParamType;
+      kNormLinearParam.normQuantParamType = param.normQuantParamType;
+      CHECK_OPERATION_STATUS_RETURN(atb_speed::common::NormLinear<NormParamType>(
+          kNormLinearParam, &kProjectionNode.operation));
+      std::vector<std::string> kInTensor = {
+          "in_encoder_output",
           "in_cross_attn_norm_weight",
           "in_cross_attn_norm_bias",
           "in_cross_attn_norm_new_weight",
           "in_cross_attn_norm_new_bias",
-          "in_cross_weight_0",
-          "in_cross_bias_0",
-          "in_cross_descale_0",
-          "in_cross_offset_0",
-          "in_cross_scale_0",
-          "in_cross_compress_idx_0",
+          "in_cross_weight_1",
+          "in_cross_scale_1",
+          "in_cross_offset_1",
+          "in_cross_descale_1",
+          "in_cross_bias_1",
+          "in_cross_compress_idx_1",
       };
       if (param.supportLora) {
         if (param.useImMask) {
-          qInTensor.push_back("in_im_mask");
+          kInTensor.push_back("in_im_mask");
         }
-        qInTensor.push_back("in_seq_len_cum_sum");
-        qInTensor.push_back("in_lora_a_0");
-        qInTensor.push_back("in_lora_b_0");
+        kInTensor.push_back("in_seq_len_cum_sum");
+        kInTensor.push_back("in_lora_a_1");
+        kInTensor.push_back("in_lora_b_1");
       }
-      qProjectionNode.inTensorIds = GetTensorIdxList(tensorMap, qInTensor);
-      qProjectionNode.outTensorIds = {
-          GetTensorIdx(tensorMap, "intermediate_q")};
+      kProjectionNode.inTensorIds = GetTensorIdxList(tensorMap, kInTensor);
+      kProjectionNode.outTensorIds = {
+          GetTensorIdx(tensorMap, "in_cross_k_cache")};
+      opGraph.nodes.push_back(kProjectionNode);
+      if (stop_after_k_only) {
+        return atb::NO_ERROR;
+      }
     }
-    opGraph.nodes.push_back(qProjectionNode);
 
-    atb::Node kProjectionNode;
-    atb_speed::common::NormLinearParam<NormParamType> kNormLinearParam;
-    kNormLinearParam.fusionLinearParam.quantType =
-        atb_speed::common::GetLinearQuantType(
-            param.packQuantType, param.layerLinearQuantType[K_LINEAR_INDEX],
-            param.enableNormQuantOp, param.layerLinearDescs[K_LINEAR_INDEX]);
-    kNormLinearParam.fusionLinearParam.hasBias = param.qkvHasBias;
-    kNormLinearParam.fusionLinearParam.isBF16 = param.isBF16;
-    kNormLinearParam.fusionLinearParam.supportLora = param.supportLora;
-    kNormLinearParam.fusionLinearParam.useImMask = param.useImMask;
-    kNormLinearParam.fusionLinearParam.loraEnableGMM = param.loraEnableGMM;
-    kNormLinearParam.fusionLinearParam.transposeType = 1;
-    kNormLinearParam.fusionLinearParam.quantGroupSize = param.quantGroupSize;
-    kNormLinearParam.fusionLinearParam.isPrefill = param.isPrefill;
-    kNormLinearParam.fusionLinearParam.matmulBackend = param.matmulBackend;
-    kNormLinearParam.skipNorm = true;
-    kNormLinearParam.normHasBias = param.normHasBias;
-    kNormLinearParam.normParamType = param.normParamType;
-    kNormLinearParam.normQuantParamType = param.normQuantParamType;
-    CHECK_OPERATION_STATUS_RETURN(atb_speed::common::NormLinear<NormParamType>(
-        kNormLinearParam, &kProjectionNode.operation));
-    std::vector<std::string> kInTensor = {
-        "in_encoder_output",
-        "in_cross_attn_norm_weight",
-        "in_cross_attn_norm_bias",
-        "in_cross_attn_norm_new_weight",
-        "in_cross_attn_norm_new_bias",
-        "in_cross_weight_1",
-        "in_cross_scale_1",
-        "in_cross_offset_1",
-        "in_cross_descale_1",
-        "in_cross_bias_1",
-        "in_cross_compress_idx_1",
-    };
-    if (param.supportLora) {
-      if (param.useImMask) {
-        kInTensor.push_back("in_im_mask");
+    if (!stop_with_identity_v && !stop_with_identity_kv) {
+      atb::Node vProjectionNode;
+      atb_speed::common::NormLinearParam<NormParamType> vNormLinearParam;
+      vNormLinearParam.fusionLinearParam.quantType =
+          atb_speed::common::GetLinearQuantType(
+              param.packQuantType, param.layerLinearQuantType[V_LINEAR_INDEX],
+              param.enableNormQuantOp, param.layerLinearDescs[V_LINEAR_INDEX]);
+      vNormLinearParam.fusionLinearParam.hasBias = param.qkvHasBias;
+      vNormLinearParam.fusionLinearParam.supportLora = param.supportLora;
+      vNormLinearParam.fusionLinearParam.useImMask = param.useImMask;
+      vNormLinearParam.fusionLinearParam.loraEnableGMM = param.loraEnableGMM;
+      vNormLinearParam.fusionLinearParam.isBF16 = param.isBF16;
+      vNormLinearParam.fusionLinearParam.transposeType = 1;
+      vNormLinearParam.fusionLinearParam.quantGroupSize = param.quantGroupSize;
+      vNormLinearParam.fusionLinearParam.isPrefill = param.isPrefill;
+      vNormLinearParam.fusionLinearParam.matmulBackend = param.matmulBackend;
+      vNormLinearParam.skipNorm = true;
+      vNormLinearParam.normHasBias = param.normHasBias;
+      vNormLinearParam.normParamType = param.normParamType;
+      vNormLinearParam.normQuantParamType = param.normQuantParamType;
+      CHECK_OPERATION_STATUS_RETURN(
+          atb_speed::common::NormLinear<NormParamType>(
+              vNormLinearParam, &vProjectionNode.operation));
+      std::vector<std::string> vInTensor = {
+          "in_encoder_output",
+          "in_cross_attn_norm_weight",
+          "in_cross_attn_norm_bias",
+          "in_cross_attn_norm_new_weight",
+          "in_cross_attn_norm_new_bias",
+          "in_cross_weight_2",
+          "in_cross_scale_2",
+          "in_cross_offset_2",
+          "in_cross_descale_2",
+          "in_cross_bias_2",
+          "in_cross_compress_idx_2",
+      };
+      if (param.supportLora) {
+        if (param.useImMask) {
+          vInTensor.push_back("in_im_mask");
+        }
+        vInTensor.push_back("in_seq_len_cum_sum");
+        vInTensor.push_back("in_lora_a_2");
+        vInTensor.push_back("in_lora_b_2");
       }
-      kInTensor.push_back("in_seq_len_cum_sum");
-      kInTensor.push_back("in_lora_a_1");
-      kInTensor.push_back("in_lora_b_1");
+      vProjectionNode.inTensorIds = GetTensorIdxList(tensorMap, vInTensor);
+      vProjectionNode.outTensorIds = {
+          GetTensorIdx(tensorMap, "in_cross_v_cache")};
+      opGraph.nodes.push_back(vProjectionNode);
     }
-    kProjectionNode.inTensorIds = GetTensorIdxList(tensorMap, kInTensor);
-    kProjectionNode.outTensorIds = {
-        GetTensorIdx(tensorMap, "in_cross_k_cache")};
-    opGraph.nodes.push_back(kProjectionNode);
-
-    atb::Node vProjectionNode;
-    atb_speed::common::NormLinearParam<NormParamType> vNormLinearParam;
-    vNormLinearParam.fusionLinearParam.quantType =
-        atb_speed::common::GetLinearQuantType(
-            param.packQuantType, param.layerLinearQuantType[V_LINEAR_INDEX],
-            param.enableNormQuantOp, param.layerLinearDescs[V_LINEAR_INDEX]);
-    vNormLinearParam.fusionLinearParam.hasBias = param.qkvHasBias;
-    vNormLinearParam.fusionLinearParam.supportLora = param.supportLora;
-    vNormLinearParam.fusionLinearParam.useImMask = param.useImMask;
-    vNormLinearParam.fusionLinearParam.loraEnableGMM = param.loraEnableGMM;
-    vNormLinearParam.fusionLinearParam.isBF16 = param.isBF16;
-    vNormLinearParam.fusionLinearParam.transposeType = 1;
-    vNormLinearParam.fusionLinearParam.quantGroupSize = param.quantGroupSize;
-    vNormLinearParam.fusionLinearParam.isPrefill = param.isPrefill;
-    vNormLinearParam.fusionLinearParam.matmulBackend = param.matmulBackend;
-    vNormLinearParam.skipNorm = true;
-    vNormLinearParam.normHasBias = param.normHasBias;
-    vNormLinearParam.normParamType = param.normParamType;
-    vNormLinearParam.normQuantParamType = param.normQuantParamType;
-    CHECK_OPERATION_STATUS_RETURN(atb_speed::common::NormLinear<NormParamType>(
-        vNormLinearParam, &vProjectionNode.operation));
-    std::vector<std::string> vInTensor = {
-        "in_encoder_output",
-        "in_cross_attn_norm_weight",
-        "in_cross_attn_norm_bias",
-        "in_cross_attn_norm_new_weight",
-        "in_cross_attn_norm_new_bias",
-        "in_cross_weight_2",
-        "in_cross_scale_2",
-        "in_cross_offset_2",
-        "in_cross_descale_2",
-        "in_cross_bias_2",
-        "in_cross_compress_idx_2",
-    };
-    if (param.supportLora) {
-      if (param.useImMask) {
-        vInTensor.push_back("in_im_mask");
-      }
-      vInTensor.push_back("in_seq_len_cum_sum");
-      vInTensor.push_back("in_lora_a_2");
-      vInTensor.push_back("in_lora_b_2");
-    }
-    vProjectionNode.inTensorIds = GetTensorIdxList(tensorMap, vInTensor);
-    vProjectionNode.outTensorIds = {
-        GetTensorIdx(tensorMap, "in_cross_v_cache")};
-    opGraph.nodes.push_back(vProjectionNode);
   } else {
     atb::Node qProjectionNode;
     atb_speed::common::NormLinearParam<NormParamType> qNormLinearParam;
@@ -1626,10 +1748,14 @@ atb::Status Attention(const FusionAttentionParam<NormParamType> &param,
         AddQKVQuantNode(param, opGraph, tensorMap, "V"));
   }
 
-  // OneRec FAS: add Cast node to extract seqlen from mask shape
-  if (param.isOneRecDecoder &&
+  const bool useOneRecDecoderFAS =
+      param.isOneRecDecoder &&
       param.attnBackend == atb_speed::common::OpBackend::ACLNN &&
-      !param.isOneRecCrossAttention) {
+      param.aclnnFAScoreParam.headNum > 0 &&
+      !(param.isPrefill && param.enableXattention);
+
+  // OneRec decoder FAS: add Cast node to extract seqlen from mask shape.
+  if (useOneRecDecoderFAS) {
     atb::Node castNode;
     atb_speed::common::AclNNCastParam castParam;
     castParam.dtype = ACL_FLOAT16;
@@ -1661,10 +1787,7 @@ atb::Status Attention(const FusionAttentionParam<NormParamType> &param,
     if (param.aclnnFusedInferAttnParam.inputLayout == "BSND") {
       CHECK_OPERATION_STATUS_RETURN(AddUnpadNode(opGraph, param, tensorMap));
     }
-  } else if (param.isOneRecDecoder &&
-             param.attnBackend == atb_speed::common::OpBackend::ACLNN &&
-             param.aclnnFAScoreParam.headNum > 0) {
-    // OneRec decoder: use ACLNN FlashAttentionScore path
+  } else if (useOneRecDecoderFAS) {
     atb::Node selfAttentionNode;
     CHECK_OPERATION_STATUS_RETURN(
         ConstructFAScoreNode(selfAttentionNode, param, tensorMap));
@@ -1760,6 +1883,249 @@ atb::Status CrossAttention(const FusionAttentionParam<NormParamType> &param,
                  TYPE_QUANT_QKV_ONLINE) {
     CHECK_OPERATION_STATUS_RETURN(
         AddQKVQuantNode(param, opGraph, tensorMap, "Q"));
+  }
+
+  if (DebugStopOneRecCrossLayer0AfterQkv(param)) {
+    atb::Node debugOutNode;
+    atb::infer::ElewiseParam debugOutParam;
+    debugOutParam.elewiseType = atb::infer::ElewiseParam::ElewiseType::ELEWISE_MULS;
+    debugOutParam.mulsParam.varAttr = 1.0f;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(debugOutParam, &debugOutNode.operation));
+    debugOutNode.inTensorIds = {GetTensorIdx(tensorMap, "intermediate_q")};
+    debugOutNode.outTensorIds = {GetTensorIdx(tensorMap, "out")};
+    opGraph.nodes.push_back(debugOutNode);
+
+    const uint32_t encoderOutputIdx =
+        atb_speed::common::GetTensorIdx(tensorMap, "in_encoder_output");
+    opGraph.inferShapeFunc =
+        [=](const atb::SVector<atb::TensorDesc> &inTensorDescs,
+            atb::SVector<atb::TensorDesc> &outTensorDescs) {
+          outTensorDescs.at(0) = inTensorDescs.at(0);
+          if (param.enableAddNorm) {
+            outTensorDescs.at(1) = inTensorDescs.at(0);
+          }
+          if (param.isPrefill && param.isOneRecCrossAttention) {
+            uint32_t outIndex = param.enableAddNorm ? 2 : 1;
+            outTensorDescs.at(outIndex) = inTensorDescs.at(encoderOutputIdx);
+            outTensorDescs.at(outIndex + 1) = inTensorDescs.at(encoderOutputIdx);
+          }
+          return atb::NO_ERROR;
+        };
+    ATB_SPEED_LOG_ERROR(
+        "OneRec cross debug: stop layer0 after cross QKV projection stage.");
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(opGraph, operation));
+    return atb::NO_ERROR;
+  }
+
+  if (DebugStopOneRecCrossLayer0AfterKvOnly(param)) {
+    atb::Node debugOutNode;
+    atb::infer::ElewiseParam debugOutParam;
+    debugOutParam.elewiseType = atb::infer::ElewiseParam::ElewiseType::ELEWISE_MULS;
+    debugOutParam.mulsParam.varAttr = 1.0f;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(debugOutParam, &debugOutNode.operation));
+    debugOutNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "intermediate_self_residual_out")};
+    debugOutNode.outTensorIds = {GetTensorIdx(tensorMap, "out")};
+    opGraph.nodes.push_back(debugOutNode);
+
+    const uint32_t encoderOutputIdx =
+        atb_speed::common::GetTensorIdx(tensorMap, "in_encoder_output");
+    opGraph.inferShapeFunc =
+        [=](const atb::SVector<atb::TensorDesc> &inTensorDescs,
+            atb::SVector<atb::TensorDesc> &outTensorDescs) {
+          outTensorDescs.at(0) = inTensorDescs.at(0);
+          if (param.enableAddNorm) {
+            outTensorDescs.at(1) = inTensorDescs.at(0);
+          }
+          if (param.isPrefill && param.isOneRecCrossAttention) {
+            uint32_t outIndex = param.enableAddNorm ? 2 : 1;
+            outTensorDescs.at(outIndex) = inTensorDescs.at(encoderOutputIdx);
+            outTensorDescs.at(outIndex + 1) = inTensorDescs.at(encoderOutputIdx);
+          }
+          return atb::NO_ERROR;
+        };
+    ATB_SPEED_LOG_ERROR(
+        "OneRec cross debug: stop layer0 after cross K/V projection stage.");
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(opGraph, operation));
+    return atb::NO_ERROR;
+  }
+
+  if (DebugStopOneRecCrossLayer0AfterKOnly(param)) {
+    atb::Node debugOutNode;
+    atb::infer::ElewiseParam debugOutParam;
+    debugOutParam.elewiseType = atb::infer::ElewiseParam::ElewiseType::ELEWISE_MULS;
+    debugOutParam.mulsParam.varAttr = 1.0f;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(debugOutParam, &debugOutNode.operation));
+    debugOutNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "intermediate_self_residual_out")};
+    debugOutNode.outTensorIds = {GetTensorIdx(tensorMap, "out")};
+    opGraph.nodes.push_back(debugOutNode);
+
+    atb::Node debugVCacheNode;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(debugOutParam, &debugVCacheNode.operation));
+    debugVCacheNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "in_encoder_output")};
+    debugVCacheNode.outTensorIds = {GetTensorIdx(tensorMap, "in_cross_v_cache")};
+    opGraph.nodes.push_back(debugVCacheNode);
+
+    const uint32_t encoderOutputIdx =
+        atb_speed::common::GetTensorIdx(tensorMap, "in_encoder_output");
+    opGraph.inferShapeFunc =
+        [=](const atb::SVector<atb::TensorDesc> &inTensorDescs,
+            atb::SVector<atb::TensorDesc> &outTensorDescs) {
+          outTensorDescs.at(0) = inTensorDescs.at(0);
+          if (param.enableAddNorm) {
+            outTensorDescs.at(1) = inTensorDescs.at(0);
+          }
+          if (param.isPrefill && param.isOneRecCrossAttention) {
+            uint32_t outIndex = param.enableAddNorm ? 2 : 1;
+            outTensorDescs.at(outIndex) = inTensorDescs.at(encoderOutputIdx);
+            outTensorDescs.at(outIndex + 1) = inTensorDescs.at(encoderOutputIdx);
+          }
+          return atb::NO_ERROR;
+        };
+    ATB_SPEED_LOG_ERROR(
+        "OneRec cross debug: stop layer0 after cross K projection stage.");
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(opGraph, operation));
+    return atb::NO_ERROR;
+  }
+
+  if (DebugStopOneRecCrossLayer0WithIdentityK(param)) {
+    atb::Node debugOutNode;
+    atb::infer::ElewiseParam debugOutParam;
+    debugOutParam.elewiseType = atb::infer::ElewiseParam::ElewiseType::ELEWISE_MULS;
+    debugOutParam.mulsParam.varAttr = 1.0f;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(debugOutParam, &debugOutNode.operation));
+    debugOutNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "intermediate_self_residual_out")};
+    debugOutNode.outTensorIds = {GetTensorIdx(tensorMap, "out")};
+    opGraph.nodes.push_back(debugOutNode);
+
+    atb::Node debugKCacheNode;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(debugOutParam, &debugKCacheNode.operation));
+    debugKCacheNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "in_encoder_output")};
+    debugKCacheNode.outTensorIds = {GetTensorIdx(tensorMap, "in_cross_k_cache")};
+    opGraph.nodes.push_back(debugKCacheNode);
+
+    const uint32_t encoderOutputIdx =
+        atb_speed::common::GetTensorIdx(tensorMap, "in_encoder_output");
+    opGraph.inferShapeFunc =
+        [=](const atb::SVector<atb::TensorDesc> &inTensorDescs,
+            atb::SVector<atb::TensorDesc> &outTensorDescs) {
+          outTensorDescs.at(0) = inTensorDescs.at(0);
+          if (param.enableAddNorm) {
+            outTensorDescs.at(1) = inTensorDescs.at(0);
+          }
+          if (param.isPrefill && param.isOneRecCrossAttention) {
+            uint32_t outIndex = param.enableAddNorm ? 2 : 1;
+            outTensorDescs.at(outIndex) = inTensorDescs.at(encoderOutputIdx);
+            outTensorDescs.at(outIndex + 1) = inTensorDescs.at(encoderOutputIdx);
+          }
+          return atb::NO_ERROR;
+        };
+    ATB_SPEED_LOG_ERROR(
+        "OneRec cross debug: stop layer0 with identity K/V cache outputs.");
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(opGraph, operation));
+    return atb::NO_ERROR;
+  }
+
+  if (DebugStopOneRecCrossLayer0WithIdentityV(param)) {
+    atb::Node debugOutNode;
+    atb::infer::ElewiseParam debugOutParam;
+    debugOutParam.elewiseType = atb::infer::ElewiseParam::ElewiseType::ELEWISE_MULS;
+    debugOutParam.mulsParam.varAttr = 1.0f;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(debugOutParam, &debugOutNode.operation));
+    debugOutNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "intermediate_self_residual_out")};
+    debugOutNode.outTensorIds = {GetTensorIdx(tensorMap, "out")};
+    opGraph.nodes.push_back(debugOutNode);
+
+    atb::Node debugVCacheNode;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(debugOutParam, &debugVCacheNode.operation));
+    debugVCacheNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "in_encoder_output")};
+    debugVCacheNode.outTensorIds = {GetTensorIdx(tensorMap, "in_cross_v_cache")};
+    opGraph.nodes.push_back(debugVCacheNode);
+
+    const uint32_t encoderOutputIdx =
+        atb_speed::common::GetTensorIdx(tensorMap, "in_encoder_output");
+    opGraph.inferShapeFunc =
+        [=](const atb::SVector<atb::TensorDesc> &inTensorDescs,
+            atb::SVector<atb::TensorDesc> &outTensorDescs) {
+          outTensorDescs.at(0) = inTensorDescs.at(0);
+          if (param.enableAddNorm) {
+            outTensorDescs.at(1) = inTensorDescs.at(0);
+          }
+          if (param.isPrefill && param.isOneRecCrossAttention) {
+            uint32_t outIndex = param.enableAddNorm ? 2 : 1;
+            outTensorDescs.at(outIndex) = inTensorDescs.at(encoderOutputIdx);
+            outTensorDescs.at(outIndex + 1) = inTensorDescs.at(encoderOutputIdx);
+          }
+          return atb::NO_ERROR;
+        };
+    ATB_SPEED_LOG_ERROR(
+        "OneRec cross debug: stop layer0 with identity V cache output.");
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(opGraph, operation));
+    return atb::NO_ERROR;
+  }
+
+  if (DebugStopOneRecCrossLayer0WithIdentityKv(param)) {
+    atb::Node debugOutNode;
+    atb::infer::ElewiseParam debugOutParam;
+    debugOutParam.elewiseType = atb::infer::ElewiseParam::ElewiseType::ELEWISE_MULS;
+    debugOutParam.mulsParam.varAttr = 1.0f;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(debugOutParam, &debugOutNode.operation));
+    debugOutNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "intermediate_self_residual_out")};
+    debugOutNode.outTensorIds = {GetTensorIdx(tensorMap, "out")};
+    opGraph.nodes.push_back(debugOutNode);
+
+    atb::Node debugKCacheNode;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(debugOutParam, &debugKCacheNode.operation));
+    debugKCacheNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "in_encoder_output")};
+    debugKCacheNode.outTensorIds = {GetTensorIdx(tensorMap, "in_cross_k_cache")};
+    opGraph.nodes.push_back(debugKCacheNode);
+
+    atb::Node debugVCacheNode;
+    CHECK_OPERATION_STATUS_RETURN(
+        atb::CreateOperation(debugOutParam, &debugVCacheNode.operation));
+    debugVCacheNode.inTensorIds = {
+        GetTensorIdx(tensorMap, "in_encoder_output")};
+    debugVCacheNode.outTensorIds = {GetTensorIdx(tensorMap, "in_cross_v_cache")};
+    opGraph.nodes.push_back(debugVCacheNode);
+
+    const uint32_t encoderOutputIdx =
+        atb_speed::common::GetTensorIdx(tensorMap, "in_encoder_output");
+    opGraph.inferShapeFunc =
+        [=](const atb::SVector<atb::TensorDesc> &inTensorDescs,
+            atb::SVector<atb::TensorDesc> &outTensorDescs) {
+          outTensorDescs.at(0) = inTensorDescs.at(0);
+          if (param.enableAddNorm) {
+            outTensorDescs.at(1) = inTensorDescs.at(0);
+          }
+          if (param.isPrefill && param.isOneRecCrossAttention) {
+            uint32_t outIndex = param.enableAddNorm ? 2 : 1;
+            outTensorDescs.at(outIndex) = inTensorDescs.at(encoderOutputIdx);
+            outTensorDescs.at(outIndex + 1) = inTensorDescs.at(encoderOutputIdx);
+          }
+          return atb::NO_ERROR;
+        };
+    ATB_SPEED_LOG_ERROR(
+        "OneRec cross debug: stop layer0 with identity K/V outputs.");
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(opGraph, operation));
+    return atb::NO_ERROR;
   }
 
   CHECK_OPERATION_STATUS_RETURN(AddSelfAttention(opGraph, param, tensorMap));
