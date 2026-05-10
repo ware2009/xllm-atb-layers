@@ -51,7 +51,7 @@ atb::Status CreateLinearParallelOperation(
   bool trans_weight = true) {
 atb::infer::LinearParallelParam param;
 param.type = atb::infer::LinearParallelParam::ParallelType::LINEAR_ALL_REDUCE;
-const auto tp_local_dp = vision_encoder_param.mapping.Get(base::VISION_TP);
+const auto tp_local_dp = vision_encoder_param.mapping.Get(base::ATTN_TP);
 const std::string backend =
     tp_local_dp.defaultBackend.empty() ? vision_encoder_param.backend
                                        : tp_local_dp.defaultBackend;
@@ -71,7 +71,7 @@ return atb::NO_ERROR;
 atb::Status CreateAllReduceOperation(
     const VisionEncoderLayerParam &vision_encoder_param, atb::Operation **op) {
 atb::infer::AllReduceParam param;
-const auto tp_local_dp = vision_encoder_param.mapping.Get(base::VISION_TP);
+const auto tp_local_dp = vision_encoder_param.mapping.Get(base::ATTN_TP);
 const std::string backend =
     tp_local_dp.defaultBackend.empty() ? vision_encoder_param.backend
                                        : tp_local_dp.defaultBackend;
