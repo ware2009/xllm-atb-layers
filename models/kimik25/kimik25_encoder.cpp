@@ -48,21 +48,41 @@ atb::Status CreateDequantSwigluQuantOperation(atb::Operation** op) {
 
 atb::Status CreateLinearParallelOperation(
   const VisionEncoderLayerParam &vision_encoder_param, atb::Operation **op,
-  bool trans_weight) {
+  bool trans_weight = true) {
 atb::infer::LinearParallelParam param;
 param.type = atb::infer::LinearParallelParam::ParallelType::LINEAR_ALL_REDUCE;
-
-// param.rank = vision_encoder_param.rank;
-// param.rankSize = vision_encoder_param.worldSize;
-param.rank = vision_encoder_param.mapping.Get(base::ATTN_TP).rank;
-param.rankSize = vision_encoder_param.mapping.Get(base::ATTN_TP).rankIds.size();
-param.backend = vision_encoder_param.backend;
-vision_encoder_param.mapping.Get(base::ATTN_TP).InitCommDomain(param.hcclComm, param.commDomain);
+const auto tp_local_dp = vision_encoder_param.mapping.Get(base::VISION_TP);
+const std::string backend =
+    tp_local_dp.defaultBackend.empty() ? vision_encoder_param.backend
+                                       : tp_local_dp.defaultBackend;
+param.rank = tp_local_dp.rank;
+param.rankSize = tp_local_dp.rankIds.size();
+param.backend = backend;
+tp_local_dp.InitCommDomain(param.hcclComm, param.commDomain, backend);
 
 if (!FLAGS_enable_atb_comm_multiprocess) {
     param.commMode = atb::infer::CommMode::COMM_MULTI_THREAD;
 }
 param.transWeight = trans_weight;
+CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(param, op));
+return atb::NO_ERROR;
+}
+
+atb::Status CreateAllReduceOperation(
+    const VisionEncoderLayerParam &vision_encoder_param, atb::Operation **op) {
+atb::infer::AllReduceParam param;
+const auto tp_local_dp = vision_encoder_param.mapping.Get(base::VISION_TP);
+const std::string backend =
+    tp_local_dp.defaultBackend.empty() ? vision_encoder_param.backend
+                                       : tp_local_dp.defaultBackend;
+param.rank = tp_local_dp.rank;
+param.rankSize = tp_local_dp.rankIds.size();
+param.backend = backend;
+tp_local_dp.InitCommDomain(param.hcclComm, param.commDomain, backend);
+
+if (!FLAGS_enable_atb_comm_multiprocess) {
+    param.commMode = atb::infer::CommMode::COMM_MULTI_THREAD;
+}
 CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(param, op));
 return atb::NO_ERROR;
 }
@@ -241,7 +261,7 @@ atb::Status BuildKimiK25AttentionBlock(
 
   // Output Projection
   if (isTp) {
-    CreateLinearParallelOperation(param, &outProjNode.operation);
+    kimi::CreateLinearParallelOperation(param, &outProjNode.operation);
     outProjNode.inTensorIds = atb_speed::common::GetTensorIdxList(
         tensorMap, {"intermediate_atten_out", "in_attn_proj_weight"});
   } else {
@@ -395,7 +415,7 @@ atb::Status BuildKimiK25MLPBlock(const VisionEncoderLayerParam& param,
 
       std::string downInput = "intermediate_fc2_out_s";
         
-      qwen::CreateAllReduceOperation(param, &fc2AllReduceNode.operation);
+      kimi::CreateAllReduceOperation(param, &fc2AllReduceNode.operation);
       fc2AllReduceNode.inTensorIds = atb_speed::common::GetTensorIdxList(
           tensorMap, {downInput});
       fc2AllReduceNode.outTensorIds = atb_speed::common::GetTensorIdxList(
@@ -454,7 +474,7 @@ atb::Status BuildKimiK25MLPBlock(const VisionEncoderLayerParam& param,
 
     // fc2 Linear
     if (isTp) {
-      CreateLinearParallelOperation(param, &fc2Node.operation);
+      kimi::CreateLinearParallelOperation(param, &fc2Node.operation);
       fc2Node.inTensorIds = atb_speed::common::GetTensorIdxList(
           tensorMap, {"intermediate_activation_out", "in_linear_fc2_weight"});
     } else {
