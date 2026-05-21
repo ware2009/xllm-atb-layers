@@ -119,6 +119,12 @@ public:
     bool mixSharedRouting = false;
     bool enableFusedMLA = false;
     bool enableIndexGmm = false;
+    bool enablePrefixCacheCP = false;
+    // When true the prefix AllGather inside SparseLatentAttention is replaced
+    // by a local identity reshape: every CP rank already owns a full KV
+    // replica (kv_split_size == 1) so cross-rank prefix exchange is
+    // unnecessary. Default false preserves legacy AllGather behavior.
+    bool enablePrefixCacheLocal = false;
 };
 
 /// The index of the GATEUP linear within the mlp

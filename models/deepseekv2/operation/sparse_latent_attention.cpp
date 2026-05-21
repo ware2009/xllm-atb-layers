@@ -104,8 +104,9 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnInTensorCandidates(
         {"attn_inner_sp_decode", {"in_seq_len_sp"}},
         {"qkvdown_dp", {"in_ffn_unpadding_idx"}
         },
-        {"prefixcache", {"in_history_compressed_kv", "in_history_k_rope", "ring_cur_seqlen", "ring_cache_seqlen"}
-        },
+        {"cp_prefixcache", {
+            "in_prefix_slots"
+        }},
         
     };
     return latentAttnInTensorCandidates;
@@ -174,12 +175,20 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
         {"qkvdown_dp", {"intermediate_qkv_all", "intermediate_qkv_unpadding_all"}},
         {"enable_preprocess_lcoc_tp", {"latent_kv", "intermediate_kv_all", "intermediate_kv_unpadding_all",
             "fused_latent_q_norm", "intermediate_q_b", "fused_q_lora_out"}},
-        {"prefixcache",
-            {
-                "rope_k_o_repeat", "intermediate_k_nope", "intermediate_v_mha",
-                "rope_k_o_repeat_history", "intermediate_k_nope_history", "intermediate_v_mha_history",
-                "temp_v_proj_b", "cur_lse", "cache_lse", "cur_intermediate_self_attention"}},
         {"enable_fused_mla", {"rope_k_o_repeat", "intermediate_k_nope", "intermediate_v_mha", "temp_v_proj_b"}},
+        // Tensors common to both prefix-cache modes (AllGather and local).
+        {"cp_prefixcache", {
+            "prefix_kv", "prefix_k_rope", "prefix_indexer_k",
+            "merged_kv", "merged_k_rope", "merged_indexer_k"
+        }},
+        // Extra tensors required only when the prefix AllGather runs (i.e.
+        // enablePrefixCacheLocal == false). With local mode every CP rank
+        // already owns the full KV shard so we skip the AllGather nodes and
+        // these intermediate buffers entirely, saving HBM equal to
+        // 3 * kvSplitSize * local_prefix_len * feature_dim.
+        {"cp_prefixcache_allgather", {
+            "prefix_kv_allgather", "prefix_k_rope_allgather", "prefix_indexer_k_allgather"
+        }},
     };
     return latentAttnIntermediateTensorCandidates;
 }
@@ -209,9 +218,6 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
     auto latentAttnInTensorCandidates = GetLatentAttnInTensorCandidates();
     auto latentAttnIntermediateTensorCandidates = GetLatentAttnIntermediateTensorCandidates();
     AddTensorToList(latentAttnInTensorCandidates, "default", inTensorList);  // translatedTensor
-    if (param.enablePrefixCache) {
-        AddTensorToList(latentAttnInTensorCandidates, "prefixcache", inTensorList);
-    }
     if (EnableFA3Quant(param)) {  // translatedFA3translatedTensor
         AddTensorToList(latentAttnInTensorCandidates, "fa3_quant", inTensorList);
         if (!(param.qLoraRank > 0 && param.enableMlaPreprocess && !param.isPrefill)) {
@@ -235,9 +241,7 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
             AddTensorToList(latentAttnIntermediateTensorCandidates, "no_q_lora", intermediateTensorList);
         }
         if (param.isPrefill || !param.enableMlaPreprocess) {
-            if (param.enablePrefixCache) {
-                AddTensorToList(latentAttnIntermediateTensorCandidates, "prefixcache", intermediateTensorList);
-            } else if (param.enableFusedMLA) {
+            if (param.enableFusedMLA) {
                 AddTensorToList(latentAttnIntermediateTensorCandidates, "enable_fused_mla", intermediateTensorList);
             } else {
                 AddTensorToList(latentAttnIntermediateTensorCandidates, "prefill", intermediateTensorList);
@@ -254,6 +258,19 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
         if (param.isPrefill) {
             AddTensorToList(latentAttnInTensorCandidates, "attn_cp_prefill", inTensorList);
             AddTensorToList(latentAttnIntermediateTensorCandidates, "attn_cp_prefill", intermediateTensorList);
+            if (param.enablePrefixCacheCP) {
+                AddTensorToList(latentAttnInTensorCandidates, "cp_prefixcache", inTensorList);
+                AddTensorToList(latentAttnIntermediateTensorCandidates, "cp_prefixcache", intermediateTensorList);
+                // AllGather intermediates only appear when KV is actually
+                // sharded across KV-split ranks (i.e. kvSplitSize > 1). In
+                // local mode the upstream graph skips both the AllGather
+                // nodes and these tensors, see AddPrefixAllGather/Concat
+                // helpers below.
+                if (!param.enablePrefixCacheLocal) {
+                    AddTensorToList(latentAttnIntermediateTensorCandidates,
+                                    "cp_prefixcache_allgather", intermediateTensorList);
+                }
+            }
         }
     }
     if (param.hasAttnInnerSp && !param.isPrefill) {
@@ -379,6 +396,112 @@ atb::Status AddSfaSplitCpNode(const LatentAttentionParam<NormParamType> &param, 
     return atb::NO_ERROR;
 }
 
+
+template <typename NormParamType>
+atb::Status AddPrefixCacheGatherNode(const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap,
+    std::string cache_tensor, std::string out_tensor,
+    int target_dim_num = -1)
+{
+    atb::Node gatherNode;
+    atb::infer::GatherParam gatherParam;
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(gatherParam, &gatherNode.operation));
+    gatherNode.inTensorIds = {
+        GetTensorIdx(tensorMap, cache_tensor),
+        GetTensorIdx(tensorMap, "in_prefix_slots")
+    };
+    gatherNode.outTensorIds = {GetTensorIdx(tensorMap, out_tensor)};
+    gatherNode.inTensorReshapeFuncs.resize(gatherNode.inTensorIds.size());
+    gatherNode.inTensorReshapeFuncs[0] = [target_dim_num]
+            (const atb::Dims &oldShape, atb::Dims &newShape) {
+        // Cache layout is [num_blocks, block_size, ...feature_dims]. We collapse
+        // [num_blocks, block_size] into one row dim, then optionally squeeze
+        // leading size-1 feature dims so the resulting Gather output matches
+        // the dim count of the live tensor used on the current branch of the
+        // downstream Concat (e.g. intermediate_kv is 3D [T, 1, lora] but
+        // rope_k_o / indexer_k_out_allgather_s are 2D [T, head_dim]).
+        // target_dim_num <= 0 falls back to the legacy "drop one dim" behavior.
+        const int feature_dims = static_cast<int>(oldShape.dimNum) - 2;
+        int target_feature = (target_dim_num > 0) ? (target_dim_num - 1)
+                                                  : feature_dims;
+        if (target_feature < 0) target_feature = 0;
+        if (target_feature > feature_dims) target_feature = feature_dims;
+        const int skip = feature_dims - target_feature;
+        newShape.dimNum = static_cast<uint32_t>(1 + target_feature);
+        newShape.dims[0] = oldShape.dims[0] * oldShape.dims[1];
+        for (int i = 0; i < target_feature; ++i) {
+            newShape.dims[1 + i] = oldShape.dims[2 + skip + i];
+        }
+    };
+    opGraph.nodes.push_back(gatherNode);
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddPrefixAllGatherCpNode(const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap,
+    std::string in, std::string out)
+{
+    atb::Node allGatherNode;
+    atb::infer::AllGatherParam allGatherParam;
+    // After the KV-split / CP decoupling refactor the prefix AllGather is sized
+    // by the KV-split group, not the token-CP group. When kvSplitInfo aliases
+    // contextParallelInfo (legacy default kvSplitSize == cpSize) behavior is
+    // unchanged byte-for-byte; when kvSplitInfo is smaller (or single-rank
+    // local) we get a smaller AllGather / no AllGather at all (the caller
+    // skips this node when enablePrefixCacheLocal is true).
+    const auto &gatherInfo = param.kvSplitInfo.IsEnabled() ?
+                             param.kvSplitInfo : param.contextParallelInfo;
+    allGatherParam.rank = gatherInfo.rank;
+    allGatherParam.rankSize = gatherInfo.rankIds.size();
+    allGatherParam.backend = gatherInfo.defaultBackend;
+    auto &gatherInfoMut = const_cast<atb_speed::common::ParallelInfo &>(gatherInfo);
+    gatherInfoMut.InitCommDomain(allGatherParam.hcclComm, allGatherParam.commDomain);
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(allGatherParam, &allGatherNode.operation));
+    allGatherNode.inTensorIds = GetTensorIdxList(tensorMap, {in});
+    allGatherNode.outTensorIds = GetTensorIdxList(tensorMap, {out});
+    opGraph.nodes.push_back(allGatherNode);
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
+atb::Status AddPrefixConcatCpNode(const LatentAttentionParam<NormParamType> &param,
+    atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap,
+    std::string prefix_in, std::string current_in, std::string out)
+{
+    atb::Node concatNode;
+    atb::infer::ConcatParam concatParam;
+    concatParam.concatDim = 0;
+    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(concatParam, &concatNode.operation));
+    concatNode.inTensorIds = {
+        GetTensorIdx(tensorMap, prefix_in),
+        GetTensorIdx(tensorMap, current_in)
+    };
+    concatNode.outTensorIds = {GetTensorIdx(tensorMap, out)};
+    concatNode.inTensorReshapeFuncs.resize(concatNode.inTensorIds.size());
+    if (param.enablePrefixCacheLocal) {
+        // Local mode: prefix_in is the raw [local_prefix_len, ...] tensor
+        // produced by AddPrefixCacheGatherNode (no AllGather), so there is
+        // no leading rank-stacked dim to collapse. The downstream
+        // SparseFlashAttention contract still requires a single merged_kv
+        // tensor of shape [local_prefix_len + cur_len, ...]; the concat op
+        // produces exactly that without any reshape.
+        concatNode.inTensorReshapeFuncs[0] = [](const atb::Dims &oldShape, atb::Dims &newShape) {
+            newShape = oldShape;
+        };
+    } else {
+        concatNode.inTensorReshapeFuncs[0] = [](const atb::Dims &oldShape, atb::Dims &newShape) {
+            // AllGather output [kv_split_size, local_len, ...] -> [kv_split_size * local_len, ...]
+            newShape.dimNum = oldShape.dimNum - 1;
+            newShape.dims[0] = oldShape.dims[0] * oldShape.dims[1];
+            for (int i = 1; i < newShape.dimNum; ++i) {
+                newShape.dims[i] = oldShape.dims[i + 1];
+            }
+        };
+    }
+    opGraph.nodes.push_back(concatNode);
+    return atb::NO_ERROR;
+}
 
 template<typename NormParamType>
 atb::Status AddCastNode(const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
@@ -1010,45 +1133,6 @@ atb::Status AddLAttnKProjBNode(const LatentAttentionParam<NormParamType> &param,
 }
 
 template <typename NormParamType>
-atb::Status AddLAttnKProjBHistoryNode(const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
-    std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node kProjBNode;
-    atb_speed::common::FusionLinearParam kProjBNodeParam;
-    kProjBNodeParam.isBF16 = param.isBF16;
-    kProjBNodeParam.hasBias = param.selfAttnHasBias;
-    kProjBNodeParam.quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED
-            ? param.packQuantType
-            : param.denseQuantType,
-        param.attnLinearQuantType[KV_PROJ_B_FOR_Q_LINEAR_INDEX], false);
-    kProjBNodeParam.quantGroupSize = param.quantGroupSize;
-    kProjBNodeParam.transposeType = param.attnLinearTransposeType[KV_PROJ_B_FOR_Q_LINEAR_INDEX];
-    CHECK_OPERATION_STATUS_RETURN(FusionLinear(kProjBNodeParam, &kProjBNode.operation));
-    kProjBNode.inTensorIds = {
-        GetTensorIdx(tensorMap, "in_history_compressed_kv"),
-        GetTensorIdx(tensorMap, "in_k_proj_b_for_q_weight"),
-        GetTensorIdx(tensorMap, "in_k_proj_b_for_q_scale"),
-        GetTensorIdx(tensorMap, "in_k_proj_b_for_q_offset"),
-        GetTensorIdx(tensorMap, "in_k_proj_b_for_q_descale"),
-        GetTensorIdx(tensorMap, "in_k_proj_b_for_q_bias"),
-        GetTensorIdx(tensorMap, "in_k_proj_b_for_q_compress_idx"),
-    };
-    kProjBNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_k_nope_history")};
-
-    kProjBNode.inTensorReshapeFuncs.resize(kProjBNode.inTensorIds.size());
-    kProjBNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 2; // 2: dim id
-        newShape.dims[0] = oldShape.dims[0] * oldShape.dims[1];
-        newShape.dims[1] = oldShape.dims[2]; // 2: dim id
-    };
-
-    opGraph.nodes.push_back(kProjBNode);
-    ATB_SPEED_LOG_DEBUG("MLA proj_k_b AddLAttnKProjBHistoryNode calculation success");
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
 atb::Status AddLAttnVProjBBeforeTransposeNode(const LatentAttentionParam<NormParamType> &param,
     atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
 {
@@ -1077,44 +1161,6 @@ atb::Status AddLAttnVProjBAfterTransposeNode(const LatentAttentionParam<NormPara
         &transposeVProjBAfterNode.operation));
     opGraph.nodes.push_back(transposeVProjBAfterNode);
     ATB_SPEED_LOG_DEBUG("MLA proj_k_b output transpose calculation success");
-    return atb::NO_ERROR;
-}
-
-template <typename NormParamType>
-atb::Status AddLAttnVProjBHistoryNode(const LatentAttentionParam<NormParamType> &param, atb::GraphParam &opGraph,
-    std::map<std::string, uint32_t> &tensorMap)
-{
-    atb::Node vProjBNode;
-    atb_speed::common::FusionLinearParam vProjBNodeParam;
-    vProjBNodeParam.isBF16 = param.isBF16;
-    vProjBNodeParam.hasBias = param.selfAttnHasBias;
-    vProjBNodeParam.quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED
-            ? param.packQuantType
-            : param.denseQuantType,
-        param.attnLinearQuantType[KV_PROJ_B_FOR_V_LINEAR_INDEX], false);
-    vProjBNodeParam.quantGroupSize = param.quantGroupSize;
-    vProjBNodeParam.transposeType = param.attnLinearTransposeType[KV_PROJ_B_FOR_V_LINEAR_INDEX];
-    CHECK_OPERATION_STATUS_RETURN(FusionLinear(vProjBNodeParam, &vProjBNode.operation));
-    vProjBNode.inTensorIds = {
-        GetTensorIdx(tensorMap, "in_history_compressed_kv"),
-        GetTensorIdx(tensorMap, "temp_v_proj_b"),
-        GetTensorIdx(tensorMap, "in_v_proj_b_for_o_scale"),
-        GetTensorIdx(tensorMap, "in_v_proj_b_for_o_offset"),
-        GetTensorIdx(tensorMap, "in_v_proj_b_for_o_descale"),
-        GetTensorIdx(tensorMap, "in_v_proj_b_for_o_bias"),
-        GetTensorIdx(tensorMap, "in_v_proj_b_for_o_compress_idx"),
-    };
-    vProjBNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_v_mha_history")};
-    vProjBNode.inTensorReshapeFuncs.resize(vProjBNode.inTensorIds.size());
-    vProjBNode.inTensorReshapeFuncs[1] = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
-        newShape.dimNum = 2; // 2: dim num
-        newShape.dims[0] = oldShape.dims[0] * oldShape.dims[1];
-        newShape.dims[1] = oldShape.dims[2]; // 2: dim id
-    };
-
-    opGraph.nodes.push_back(vProjBNode);
-    ATB_SPEED_LOG_DEBUG("MLA proj_v_b AddLAttnVProjBHistoryNode calculation success");
     return atb::NO_ERROR;
 }
 
@@ -1839,14 +1885,16 @@ atb::Status AddSparseFlashAttentionCpNode(
     std::map<std::string, uint32_t> &tensorMap)
 {
     // knope, kpe gathersplit - "k_gather_index"               | pre/next
+    auto kv_source = param.enablePrefixCacheCP ? "merged_kv" : "intermediate_kv";
+    auto k_rope_source = param.enablePrefixCacheCP ? "merged_k_rope" : "rope_k_o";
     CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
-        "intermediate_kv", "intermediate_kv_prev", "k_gather_index_prev"));
+        kv_source, "intermediate_kv_prev", "k_gather_index_prev"));
     CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
-        "intermediate_kv", "intermediate_kv_next", "k_gather_index_next"));
+        kv_source, "intermediate_kv_next", "k_gather_index_next"));
     CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
-        "rope_k_o", "rope_k_o_prev", "k_gather_index_prev"));
+        k_rope_source, "rope_k_o_prev", "k_gather_index_prev"));
     CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
-        "rope_k_o", "rope_k_o_next", "k_gather_index_next"));
+        k_rope_source, "rope_k_o_next", "k_gather_index_next"));
 
     // qnope,qpe,topk gather&split - "cp_load_balance_idx"   | pre/next
     CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
@@ -2064,6 +2112,55 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
     }
     CHECK_OPERATION_STATUS_RETURN(AddIndexerKReshapeAndCacheNode(param, opGraph, tensorMap));
 
+    // CP + PrefixCache: load prefix from cache, AllGather, and Concat with current.
+    // Each Concat's current-branch tensor has a different dim count:
+    //   - intermediate_kv   : 3D [T, 1, kvLoraRank]      (after KVNorm UnSqueeze)
+    //   - rope_k_o          : 2D [T, qkRopeHeadDim]      (Rope op output, squeezed)
+    //   - indexer_k_out_*_s : 2D [T, indexerHeadDim]     (no head dim added)
+    // The cache, however, is 4D [num_blocks, block_size, 1, feature]. We pass the
+    // expected target_dim_num to each Gather so the prefix branch comes out with
+    // matching dim count, otherwise the downstream Concat infer-shape fails.
+    if (param.enablePrefixCacheCP && param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+        CHECK_OPERATION_STATUS_RETURN(AddPrefixCacheGatherNode(param, opGraph, tensorMap,
+            "in_k_cache", "prefix_kv", /*target_dim_num=*/3));
+        CHECK_OPERATION_STATUS_RETURN(AddPrefixCacheGatherNode(param, opGraph, tensorMap,
+            "in_k_rope_cache", "prefix_k_rope", /*target_dim_num=*/2));
+        CHECK_OPERATION_STATUS_RETURN(AddPrefixCacheGatherNode(param, opGraph, tensorMap,
+            "in_k_cache_indexer", "prefix_indexer_k", /*target_dim_num=*/2));
+
+        // enablePrefixCacheLocal: every CP rank already owns the full KV
+        // (kvSplitInfo.worldSize == 1) so the prefix AllGather is a no-op.
+        // We skip the 3 AllGather nodes and feed the local prefix tensors
+        // directly into the per-path Concat. The Concat itself is kept so
+        // the downstream SparseFlashAttention input contract
+        // (`merged_kv = concat(prefix, current)` of shape [local_prefix_len +
+        // cur_len, ...]) stays unchanged. AddPrefixConcatCpNode reshapes its
+        // first input differently in the local vs. AllGather case (identity
+        // vs. stacked-rank collapse) - see its body.
+        const char *kv_prefix_src = "prefix_kv_allgather";
+        const char *k_rope_prefix_src = "prefix_k_rope_allgather";
+        const char *indexer_prefix_src = "prefix_indexer_k_allgather";
+        if (!param.enablePrefixCacheLocal) {
+            CHECK_OPERATION_STATUS_RETURN(AddPrefixAllGatherCpNode(param, opGraph, tensorMap,
+                "prefix_kv", "prefix_kv_allgather"));
+            CHECK_OPERATION_STATUS_RETURN(AddPrefixAllGatherCpNode(param, opGraph, tensorMap,
+                "prefix_k_rope", "prefix_k_rope_allgather"));
+            CHECK_OPERATION_STATUS_RETURN(AddPrefixAllGatherCpNode(param, opGraph, tensorMap,
+                "prefix_indexer_k", "prefix_indexer_k_allgather"));
+        } else {
+            kv_prefix_src = "prefix_kv";
+            k_rope_prefix_src = "prefix_k_rope";
+            indexer_prefix_src = "prefix_indexer_k";
+        }
+
+        CHECK_OPERATION_STATUS_RETURN(AddPrefixConcatCpNode(param, opGraph, tensorMap,
+            kv_prefix_src, "intermediate_kv", "merged_kv"));
+        CHECK_OPERATION_STATUS_RETURN(AddPrefixConcatCpNode(param, opGraph, tensorMap,
+            k_rope_prefix_src, "rope_k_o", "merged_k_rope"));
+        CHECK_OPERATION_STATUS_RETURN(AddPrefixConcatCpNode(param, opGraph, tensorMap,
+            indexer_prefix_src, "indexer_k_out_allgather_s", "merged_indexer_k"));
+    }
+
     CHECK_OPERATION_STATUS_RETURN(AddIndexerWeightNode(param, opGraph, tensorMap));
 
     if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
@@ -2081,10 +2178,11 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
         // get actual seq_len_q / seq_len_kv      | prev / next
         //      actual_seq_lengths_query_prev / actual_seq_lengths_key_prev
         // k rerank - "k_gather_index"            | prev / next
+        auto indexer_k_source = param.enablePrefixCacheCP ? "merged_indexer_k" : "indexer_k_out_allgather_s";
         CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
-            "indexer_k_out_allgather_s", "indexer_k_out_prev", "k_gather_index_prev"));
+            indexer_k_source, "indexer_k_out_prev", "k_gather_index_prev"));
         CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
-            "indexer_k_out_allgather_s", "indexer_k_out_next", "k_gather_index_next"));
+            indexer_k_source, "indexer_k_out_next", "k_gather_index_next"));
         CHECK_OPERATION_STATUS_RETURN(AddLightIndexerCpNode(param, opGraph, tensorMap));
             //intermediate_topk_indices_prev_cat intermediate_topk_indices_next_cat
 

@@ -143,6 +143,9 @@ std::map<std::string, std::vector<std::string>> GetDeepseekV2LayerInTensorCandid
         {"prefixcache", {
             "in_history_compressed_kv", "in_history_k_rope", "ring_cur_seqlen", "ring_cache_seqlen"
         }},
+        {"cp_prefixcache", {
+            "in_prefix_slots"
+        }},
 	{"indexer_intensor", {
             "in_k_cache_indexer", "in_seq_len_query"}}
     };
@@ -270,6 +273,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(
         }
         else {
             atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "attn_cp_prefill", inTensorList);
+        }
+        if (param.enablePrefixCacheCP && param.index_n_heads > 0) {	
+            atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "cp_prefixcache", inTensorList);
         }
     }
     if (param.mapping.Get(base::ATTN_INNER_SP).IsEnabled() && !param.isPrefill) {
@@ -513,6 +519,17 @@ atb::Status SetLatentAttentionParam(
     param.mapping.Get(base::ATTN_TP).InitCommDomain(
         latentAttentionParam.lcocHcclComm, latentAttentionParam.lcocAttnTpDomain);
     latentAttentionParam.enablePrefixCache = param.enablePrefixCache;
+    latentAttentionParam.enablePrefixCacheCP = param.enablePrefixCacheCP;
+    latentAttentionParam.enablePrefixCacheLocal = param.enablePrefixCacheLocal;
+    // kvSplitInfo defaults to "empty" (IsEnabled() == false), in which case
+    // SparseLatentAttention falls back to contextParallelInfo for the prefix
+    // AllGather - that is the legacy (kv_split_size == cp_size) behavior.
+    // When the xLLM framework wants to override the KV-split group it must
+    // populate this directly from MappingNPU::to_json()["kvSplit"]; today we
+    // intentionally leave it empty so the upstream switch is only flipped via
+    // `enablePrefixCacheLocal` (kv_split_size == 1 case). Future work will
+    // wire kvSplitInfo through `base::Mapping` once a dedicated enum slot is
+    // added on the atb_speed side.
     latentAttentionParam.normEps = param.normEps;
     latentAttentionParam.softmaxScale = param.softmaxScale;
     return atb::NO_ERROR;
@@ -577,6 +594,9 @@ int64_t SetAttention(atb::GraphParam &opGraph, const DecoderLayerParam &param,
         }
         else {
             atb_speed::common::AddTensorToList(GetDeepseekV2LayerInTensorCandidates(), "attn_cp_prefill", attnInTensorNames);
+        }
+        if (param.enablePrefixCacheCP && param.index_n_heads > 0) {
+            atb_speed::common::AddTensorToList(GetDeepseekV2LayerInTensorCandidates(), "cp_prefixcache", attnInTensorNames);
         }
     }
     if (param.mapping.Get(base::ATTN_INNER_SP).IsEnabled() && !param.isPrefill) {

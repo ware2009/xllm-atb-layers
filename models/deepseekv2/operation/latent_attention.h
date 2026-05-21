@@ -123,6 +123,16 @@ struct LatentAttentionParam {
     std::string lcocAttnTpDomain = "";
     HcclComm lcocHcclComm = nullptr;
     bool enablePrefixCache = false;
+    bool enablePrefixCacheCP = false;
+    // KV-split parallel group (independent from CP). Used by SparseLatentAttention
+    // to size the prefix AllGather: the gather aggregates kvSplitInfo.worldSize
+    // partial KV shards into the full prefix. When the upstream framework sets
+    // enablePrefixCacheLocal=true (kvSplitInfo.worldSize == 1) the AllGather
+    // nodes are replaced by an identity reshape so the per-rank concat layout
+    // stays unchanged and the downstream SparseFlashAttention input contract
+    // is preserved.
+    atb_speed::common::ParallelInfo kvSplitInfo;
+    bool enablePrefixCacheLocal = false;
     bool enableFusedMLA = false;
     float normEps = 0;
     float softmaxScale = 0;
