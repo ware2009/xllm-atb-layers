@@ -30,6 +30,7 @@ cc_library(
     nlohmann_json::nlohmann_json
     gflags::gflags
     spdlog::spdlog
+    triton_adapter
 )
 
 target_include_directories(xllm_atb_layers PUBLIC

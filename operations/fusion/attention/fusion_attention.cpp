@@ -768,6 +768,12 @@ AddFAttnQKVLinearSplitNode(const FusionAttentionParam<NormParamType> &param,
     qkvInTensorNames.push_back("recv_count");
     qkvInTensorNames.push_back("fake_ag_shape");
   }
+
+  if (param.enableSplitRmsNormRope) {
+    qkvInTensorNames.push_back("in_cos_embed");
+    qkvInTensorNames.push_back("in_sin_embed");
+  }
+
   qkvLinearSplitNode.inTensorIds =
       GetTensorIdxList(tensorMap, qkvInTensorNames);
   std::vector<std::string> qkvOutTensorNames;
@@ -1704,7 +1710,7 @@ atb::Status Attention(const FusionAttentionParam<NormParamType> &param,
         AddFAttnQKVLinearSplitNode(param, opGraph, tensorMap));
 
     // Rope Node
-    if (param.rotaryType != RotaryType::NO_ROTARY) {
+    if (param.rotaryType != RotaryType::NO_ROTARY && !param.enableSplitRmsNormRope) {
       CHECK_OPERATION_STATUS_RETURN(
           AddFAttnRopeNode(param, opGraph, tensorMap));
     }
