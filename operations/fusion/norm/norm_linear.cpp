@@ -147,7 +147,8 @@ std::map<std::string, uint32_t> ConstructNormTensorMap(
     if (UseAddRmsNormDynamicQuant(param)) {
         AddTensorToList(normIntermediateTensorCandidates, "addrmsnormdynamicquant", intermediateTensorList);
     }
-    if (param.enableAclnnRmsNorm || param.enableAddNorm) {
+    if ((param.enableAclnnRmsNorm || param.enableAddNorm) &&
+        !UseAddRmsNormQuant(param) && !UseAddRmsNormDynamicQuant(param)) {
         AddTensorToList(normIntermediateTensorCandidates, "useless", intermediateTensorList);
     }
     if (param.enableModelConfuscation) {
@@ -178,7 +179,8 @@ int64_t InsertNorm(
         normNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "in_residual_input"));
     }
     normNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_norm")};
-    if (param.enableAclnnRmsNorm || param.enableAddNorm) {
+    if ((param.enableAclnnRmsNorm || param.enableAddNorm) &&
+        !useAddRmsNormQuant && !useAddRmsNormDynamicQuant) {
         normNode.outTensorIds.push_back(GetTensorIdx(tensorMap, "intermediate_rstd"));
     }
     if (useAddRmsNormQuant || useAddRmsNormDynamicQuant) {
