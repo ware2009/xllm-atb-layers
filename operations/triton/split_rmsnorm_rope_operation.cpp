@@ -15,6 +15,7 @@
 #include <sstream>
 #include "acl/acl.h"
 #include "operations/aclnn/utils/utils.h"
+#include "torch_api/operation_factory.h"
 
 namespace atb_speed {
 
@@ -62,9 +63,6 @@ atb::Status SplitRmsnormRopeOperation::InferShape(const atb::SVector<atb::Tensor
     outTensorDescs.at(1).format = inTensorDescs.at(0).format;
     outTensorDescs.at(2).format = inTensorDescs.at(0).format;
     ATB_SPEED_LOG_INFO("SplitRmsnormRopeOperation Infer shape end");
-    param_.headDim = inTensorDescs.at(1).shape.dims[1];
-    param_.qHiddenSize = outTensorDescs.at(0).shape.dims[1];
-    param_.kvHiddenSize = param_.headDim * param_.kvHeadNum;
     
     return atb::NO_ERROR;
 }
@@ -95,25 +93,6 @@ std::string SplitRmsnormRopeOperation::GenerateKernelName() const
 atb::Status SplitRmsnormRopeOperation::Setup(const atb::VariantPack &variantPack, uint64_t &workspaceSize, atb::Context *context)
 {
     ATB_SPEED_LOG_INFO("SplitRmsnormRopeOperation Setup start");
-    int64_t vectorCoreNum;
-    int64_t gridX = variantPack.inTensors.at(0).desc.shape.dims[0];
-    int64_t gridY = variantPack.inTensors.at(0).desc.shape.dims[1] / param_.headDim;
-    int32_t deviceId;
-    int ret = aclrtGetDevice(&deviceId);
-    if (ret != 0) {
-        ATB_SPEED_LOG_ERROR("aclrtGetDevice failed, error code: " + std::to_string(ret)); 
-        return atb::ERROR_RT_FAIL;
-    }
-    ret = aclrtGetDeviceInfo(deviceId, aclrtDevAttr::ACL_DEV_ATTR_VECTOR_CORE_NUM, &vectorCoreNum);
-    if (ret != 0) {
-        ATB_SPEED_LOG_ERROR("aclrtGetDeviceInfo failed, error code: " + std::to_string(ret));
-        return atb::ERROR_RT_FAIL;
-    }
-    args_.gridX = gridX;
-    args_.gridY = gridY;
-    args_.gridZ = param_.gridZ;
-    blockNum_ = std::min(gridX * gridY * param_.gridZ, vectorCoreNum);
-
     std::string kernelName = GenerateKernelName();
     ATB_SPEED_LOG_INFO("Generated kernel name: " + kernelName);
 
@@ -125,52 +104,43 @@ atb::Status SplitRmsnormRopeOperation::Setup(const atb::VariantPack &variantPack
             return atb::ERROR_RT_FAIL;
         }
     }
-    kernel_stub_ = reg.get_kernel_stub(kernelName);
+    auto kernelStub = reg.get_kernel_stub(kernelName);
     
-    if (kernel_stub_ == nullptr) {
+    if (kernelStub == nullptr) {
         ATB_SPEED_LOG_ERROR("Kernel stub is null for '" + kernelName + "'");
         return atb::ERROR_RT_FAIL;
     }
 
-    int64_t per_block_ws = -1;
-    int64_t lock_init_value = 0;
-    int64_t lock_num = -1;
-    reg.get_kernel_workspace_config(kernelName, per_block_ws, lock_init_value, lock_num);
-    per_block_workspace_size_ = (per_block_ws > 0) ? per_block_ws : 0;
-    workspaceSize = per_block_workspace_size_ * blockNum_;
+    // OperationFactory::execute allocates Triton workspace and sync block lock
+    // just like the standalone C++ unit test path, so ATB does not need to
+    // provide workspace for this operation.
+    workspaceSize = 0;
     ATB_SPEED_LOG_INFO("SplitRmsnormRopeOperation Setup end, and workspaceSize: " + std::to_string(workspaceSize));
-    std::stringstream ss;
-    ss << "SplitRmsnormRopeOperation gridX " << gridX << " , gridY " << gridY
-       << " , gridZ " << param_.gridZ << ", vectorCoreNum " << vectorCoreNum << std::endl;
-    ATB_SPEED_LOG_INFO(ss.str());
     return atb::NO_ERROR;
 }
 
 atb::Status SplitRmsnormRopeOperation::Execute(const atb::VariantPack &variantPack, uint8_t *workspace, uint64_t workspaceSize, atb::Context* context)
 {
     ATB_SPEED_LOG_INFO("SplitRmsnormRopeOperation Execute start");
-    void *fftsAddr = nullptr;
-    uint32_t fftsLen;
-    int ret = rtGetC2cCtrlAddr((uint64_t*)&fftsAddr, &fftsLen);
-    if (ret != 0) {
-        std::stringstream ss;
-        ss << "rtGetC2cCtrlAddr failed, error code: " << ret << std::endl;
-        ATB_SPEED_LOG_ERROR(ss.str());
-        return atb::ERROR_RT_FAIL;
-    }
-    args_.fftsAddr = fftsAddr;
-    args_.workspaceAddr = workspace;
-    args_.input = variantPack.inTensors.at(0).deviceData;
-    args_.sin = variantPack.inTensors.at(1).deviceData;
-    args_.cos = variantPack.inTensors.at(2).deviceData;
-    args_.qOutput = variantPack.outTensors.at(0).deviceData;
-    args_.kOutput = variantPack.outTensors.at(1).deviceData;
-    args_.vOutput = variantPack.outTensors.at(2).deviceData;
-    args_.qWeight = variantPack.inTensors.at(3).deviceData;
-    args_.kWeight = variantPack.inTensors.at(4).deviceData;
-    args_.batchSize = static_cast<int32_t>(variantPack.inTensors.at(0).desc.shape.dims[0]);
+    int32_t gridX = static_cast<int32_t>(variantPack.inTensors.at(0).desc.shape.dims[0]);
+    int32_t gridY = static_cast<int32_t>(variantPack.inTensors.at(0).desc.shape.dims[1] / param_.headDim);
+    int32_t gridZ = param_.gridZ;
+    std::string kernelName = GenerateKernelName();
 
-    ret = rtKernelLaunch(kernel_stub_, blockNum_, static_cast<void *>(&args_), sizeof(args_), NULL, context->GetExecuteStream());
+    auto& op = xllm::kernel::npu::OperationFactory::instance().split_rmsnorm_rope(kernelName);
+    auto ret = op.execute(context->GetExecuteStream(), gridX, gridY, gridZ, [&](xllm::kernel::npu::ArgsBuilder& ab) {
+        ab.constructArgs(variantPack.inTensors.at(0).deviceData,
+                         variantPack.inTensors.at(1).deviceData,
+                         variantPack.inTensors.at(2).deviceData,
+                         variantPack.outTensors.at(0).deviceData,
+                         variantPack.outTensors.at(1).deviceData,
+                         variantPack.outTensors.at(2).deviceData,
+                         variantPack.inTensors.at(3).deviceData,
+                         nullptr,
+                         variantPack.inTensors.at(4).deviceData,
+                         nullptr,
+                         gridX);
+    });
     if (ret != 0) {
         std::stringstream ss;
         ss << "rtKernelLaunch failed, error code: " << ret << std::endl;
@@ -182,3 +152,4 @@ atb::Status SplitRmsnormRopeOperation::Execute(const atb::VariantPack &variantPa
 }
 
 } // namespace atb_speed
+

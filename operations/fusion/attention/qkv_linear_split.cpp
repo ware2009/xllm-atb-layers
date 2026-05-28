@@ -430,7 +430,13 @@ atb::Status AddSplitQKVRmsNormRopeNode(const FusionAttentionParam<NormParamType>
 {
     atb::Node SplitRmsnormRopeNode;
     atb_speed::SplitRmsnormRopeParam splitRmsnormRopeParam;
-    splitRmsnormRopeParam.kvHeadNum = param.pageAttentionParam.kvHeadNum;
+    splitRmsnormRopeParam.headDim = param.headDim;
+    splitRmsnormRopeParam.kvHeadNum = param.selfAttentionParam.kvHeadNum;
+    splitRmsnormRopeParam.qHiddenSize =
+        param.selfAttentionParam.headNum * param.headDim;
+    splitRmsnormRopeParam.kvHiddenSize =
+        param.selfAttentionParam.kvHeadNum * param.headDim;
+    splitRmsnormRopeParam.hasBias = false;
     SplitRmsnormRopeNode.operation = new atb_speed::SplitRmsnormRopeOperation("SplitRmsnormRopeOperation", splitRmsnormRopeParam);
 
     std::vector<std::string> inTensor = {
