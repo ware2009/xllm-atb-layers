@@ -129,6 +129,8 @@ struct MlpParam {
     atb_speed::common::TensorParallelInfo downLinearTensorParallelInfo;
     /// A flag indicating whether to use the atb matmul backend
     int matmulBackend = atb_speed::common::OpBackend::ATB;
+    /// A flag indicating whether to use the atb or aclnn swiglu backend
+    int swigluBackend = atb_speed::common::OpBackend::ATB;
     /// Specifies whether the post attention norm enables antioutlier
     bool isAntiOutlier = false;
     // Use Aclnn RmsNorm instead of ATB RmsNorm.

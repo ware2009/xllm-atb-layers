@@ -136,6 +136,8 @@ public:
     atb_speed::common::OpBackend attnBackend = atb_speed::common::OpBackend::ATB;
     /// The backend of the matmul module; refer to `OpBackend` for the supported values
     atb_speed::common::OpBackend matmulBackend = atb_speed::common::OpBackend::ATB;
+    /// The backend of the SwiGLU module; refer to `OpBackend` for the supported values
+    atb_speed::common::OpBackend swigluBackend = atb_speed::common::OpBackend::ATB;
     /// The type of the position embedding; refer to `PositionEmbeddingType` for the supported values
     PositionEmbeddingType positionEmbeddingType = PositionEmbeddingType::ROPE;
     /// The epsilon value used for normalization
@@ -220,7 +222,8 @@ public:
                       << ", enableMC2: " << enableMC2
                       << ", weightQuantType: " << weightQuantType
                       << ", enableSwigluQuant" << enableSwigluQuant
-                      << ", matmulBackend" << matmulBackend);
+                      << ", matmulBackend" << matmulBackend
+                      << ", swigluBackend" << swigluBackend);
     }
     /// A member function that checks and validates the values of all parameters
     virtual void CheckParam() {};

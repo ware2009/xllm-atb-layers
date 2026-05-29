@@ -15,6 +15,7 @@
  */
 #include <atb/atb_infer.h>
 #include "operations/aclnn/ops/dequant_swiglu_quant_operation.h"
+#include "operations/aclnn/ops/swi_glu_operation.h"
 #include "operations/fusion/linear/linear.h"
 #include "operations/fusion/utils.h"
 #include "operations/fusion/mlp/mlp.h"
@@ -128,7 +129,6 @@ void SetGateUpNormLinearParam(atb_speed::common::NormLinearParam<NormParamType> 
     gateUpNormLinearParam.fusionLinearParam.transposeType = param.layerLinearTransposeType[GATE_LINEAR_INDEX];
     gateUpNormLinearParam.fusionLinearParam.quantGroupSize = param.quantGroupSize;
     gateUpNormLinearParam.fusionLinearParam.matmulBackend = param.matmulBackend;
-    gateUpNormLinearParam.fusionLinearParam.matmulBackend = atb_speed::common::OpBackend::ATB;
     gateUpNormLinearParam.fusionLinearParam.isPrefill = param.isPrefill;
     gateUpNormLinearParam.skipNorm = param.skipNorm;
     gateUpNormLinearParam.normHasBias = param.normHasBias;
@@ -219,7 +219,6 @@ void SetUpNormLinearParam(atb_speed::common::NormLinearParam<NormParamType> &upN
     upNormLinearParam.fusionLinearParam.transposeType = param.layerLinearTransposeType[UP_LINEAR_INDEX];
     upNormLinearParam.fusionLinearParam.quantGroupSize = param.quantGroupSize;
     upNormLinearParam.fusionLinearParam.matmulBackend = param.matmulBackend;
-    upNormLinearParam.fusionLinearParam.matmulBackend = atb_speed::common::OpBackend::ATB;
     upNormLinearParam.fusionLinearParam.isPrefill = param.isPrefill;
     upNormLinearParam.skipNorm = param.skipNorm;
     upNormLinearParam.normHasBias = param.normHasBias;
@@ -360,7 +359,12 @@ atb::Status AddMlpSwiGLUActivation(const MlpParam<NormParamType> &param, atb::Gr
     }
 
     atb::Operation* activationOp = nullptr;
-    CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(param.activationParam, &activationOp));
+    if (param.swigluBackend == atb_speed::common::OpBackend::ACLNN) {
+        activationOp = new atb_speed::common::SwiGluOperation(
+            "Swiglu", param.activationParam.dim);
+    } else {
+        CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(param.activationParam, &activationOp));
+    }
     graphBuilder->AddOperation(activationOp, {"intermediate_gate_up"}, {"intermediate_activation_out"});
     return atb::NO_ERROR;
 }
@@ -408,7 +412,6 @@ void SetDownLinearParallelParam(const MlpParam<NormParamType> &param,
     downLinearParallelParam.fusionLinearParam.transposeType = param.layerLinearTransposeType[DOWN_LINEAR_INDEX];
     downLinearParallelParam.fusionLinearParam.quantGroupSize = param.quantGroupSize;
     downLinearParallelParam.fusionLinearParam.matmulBackend = param.matmulBackend;
-    downLinearParallelParam.fusionLinearParam.matmulBackend = atb_speed::common::OpBackend::ATB;
     downLinearParallelParam.fusionLinearParam.isPrefill = param.isPrefill;
     downLinearParallelParam.tensorParallelInfo = param.downLinearTensorParallelInfo;
     downLinearParallelParam.supportLcoc = param.supportLcoc;

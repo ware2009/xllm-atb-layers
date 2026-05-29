@@ -157,6 +157,7 @@ void QwenDecoderLayer::SetFusionAttentionParam(
     fusionAttentionParam.enableAclnnRmsNorm = param.enableAclnnRmsNorm;
     fusionAttentionParam.isPrefixCacheWithoutChunk = param.isPrefixCacheWithoutChunk;
     fusionAttentionParam.enableSplitRmsNormRope = param.enableSplitRmsNormRope;
+    fusionAttentionParam.matmulBackend = param.matmulBackend;
     if (param.isFIA) {
         fusionAttentionParam.aclnnFusedInferAttnParam.needMask = true;
         fusionAttentionParam.aclnnFusedInferAttnParam.enablePa = true;
