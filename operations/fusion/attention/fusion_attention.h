@@ -233,6 +233,8 @@ template <typename NormParamType> struct FusionAttentionParam {
   bool isOneRecDecoder = false;
   bool isOneRecCrossAttention = false;
   bool enableOneRecPrefillOnly = false;
+  // enable spliteRmsnormRope operation
+  bool enableSplitRmsNormRope = false;
 };
 
 template <typename NormParamType>

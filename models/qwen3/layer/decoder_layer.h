@@ -41,6 +41,7 @@ public:
     bool isPrefixCacheWithoutChunk = false;
     // enable end-to-end decode kv cache pipeline (prefill + decode)
     bool enableXattention = false;
+    bool enableSplitRmsNormRope = false;
     std::shared_ptr<int> bs = std::make_shared<int>(0);
 };
 

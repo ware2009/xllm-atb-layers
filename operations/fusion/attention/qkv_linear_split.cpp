@@ -22,6 +22,7 @@
 #include "operations/aclnn/ops/rms_norm_operation.h"
 #include "operations/fusion/attention/qkv_linear_split.h"
 #include "operations/aclnn/ops/rms_norm_operation.h"
+#include "operations/triton/split_rmsnorm_rope_operation.h"
 
 namespace atb_speed {
 namespace common {
@@ -50,6 +51,7 @@ std::map<std::string, std::vector<std::string>> GetQKVInTensorCandidates()
         {"flash_comm", {
             "send_counts", "sdispls", "send_count", "recv_counts", "rdispls", "recv_count", "fake_ag_shape"}
         },
+        {"split_rms_norm_rope", {"in_cos_embed", "in_sin_embed"}},
     };
     return qkvInTensorCandidates;
 }
@@ -100,7 +102,9 @@ std::map<std::string, uint32_t> ConstructQKVTensorMap(
     if (isPack && !param.enableRopeQuantKvcache) {
         AddTensorToList(qkvIntermediateTensorCandidates, "qkv_pack", intermediateTensorList);
         if (param.useQKNorm) {
-            AddTensorToList(qkvIntermediateTensorCandidates, "qk_norm", intermediateTensorList);
+            if (!param.enableSplitRmsNormRope) {
+              AddTensorToList(qkvIntermediateTensorCandidates, "qk_norm", intermediateTensorList);
+ 	    }
             AddTensorToList(qkvInTensorCandidates, "qk_norm", inTensorList);
         }
     }
@@ -117,6 +121,12 @@ std::map<std::string, uint32_t> ConstructQKVTensorMap(
     if (param.enableFlashComm) {
         AddTensorToList(qkvInTensorCandidates, "flash_comm", inTensorList);
     }
+
+    // add SplitRmsNormRope 
+    if (param.enableSplitRmsNormRope) {
+        AddTensorToList(qkvInTensorCandidates, "split_rms_norm_rope", inTensorList);
+    }
+
     // translatedoutTensor
     if (param.enableRopeQuantKvcache) {
         AddTensorToList(qkvOutTensorCandidates, "dequant_rope", outTensorList);
@@ -415,6 +425,50 @@ atb::Status AddVNormLinearNode(const FusionAttentionParam<NormParamType> &param,
 }
 
 template <typename NormParamType>
+atb::Status AddSplitQKVRmsNormRopeNode(const FusionAttentionParam<NormParamType> &param,
+                atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
+{
+    atb::Node SplitRmsnormRopeNode;
+    atb_speed::SplitRmsnormRopeParam splitRmsnormRopeParam;
+    splitRmsnormRopeParam.headDim = param.headDim;
+    splitRmsnormRopeParam.kvHeadNum = param.selfAttentionParam.kvHeadNum;
+    splitRmsnormRopeParam.qHiddenSize =
+        param.selfAttentionParam.headNum * param.headDim;
+    splitRmsnormRopeParam.kvHiddenSize =
+        param.selfAttentionParam.kvHeadNum * param.headDim;
+    splitRmsnormRopeParam.hasBias = false;
+    SplitRmsnormRopeNode.operation = new atb_speed::SplitRmsnormRopeOperation("SplitRmsnormRopeOperation", splitRmsnormRopeParam);
+
+    std::vector<std::string> inTensor = {
+        "intermediate_qkv", "in_sin_embed", "in_cos_embed", "in_q_norm_weight", "in_k_norm_weight"
+    };
+
+    std::vector<std::string> outTensor = {
+        "out_q", "out_k", "out_v"
+    };
+
+    SplitRmsnormRopeNode.inTensorIds = GetTensorIdxList(tensorMap, inTensor);
+    SplitRmsnormRopeNode.outTensorIds = GetTensorIdxList(tensorMap, outTensor);
+    // May need to reshape in prefill / chunked prefill situation
+    /*
+    SplitRmsnormRopeNode.inTensorReshapeFuncs.resize(SplitRmsnormRopeNode.inTensorIds.size());
+    ropeNode.inTensorReshapeFuncs.at(0) = &SqueezeHeadNumHeadDim;
+    SplitRmsnormRopeNode.inTensorReshapeFuncs.at(0) = [=](const atb::Dims &oldShape, atb::Dims &newShape) {
+    if (oldShape.dimNum == 3){
+        newShape.dimNum = 2;
+        newShape.dims[0] = oldShape.dims[0];  
+        newShape.dims[1] = oldShape.dims[1] * oldShape.dims[2];
+    } else if (oldShape.dimNum == 2) {
+        newShape.dims[0] = oldShape.dims[0];
+        newShape.dims[1] = oldShape.dims[1];
+      }
+    };
+    */
+    opGraph.nodes.push_back(SplitRmsnormRopeNode);
+    return atb::NO_ERROR;
+}
+
+template <typename NormParamType>
 void QKVLinearSplitInferShapeFunc(const FusionAttentionParam<NormParamType> &param,
     atb::GraphParam &opGraph, uint32_t inQKVInputIdx, uint32_t inResidualAddInputIdx, uint32_t inFakeAgShapeIdx)
 {
@@ -494,9 +548,13 @@ atb::Status QKVLinearSplit(const FusionAttentionParam<NormParamType> &param, atb
 
     if (!param.enableRopeQuantKvcache) {
         if (isPack && param.isGroupedQueryAttention) {  // Split GQA
-            CHECK_OPERATION_STATUS_RETURN(AddSplitQKVNode(param, opGraph, tensorMap));
-            if (param.useQKNorm) {
-                CHECK_OPERATION_STATUS_RETURN(AddQKNormNode(param, opGraph, tensorMap));
+            if (param.enableSplitRmsNormRope) {
+                CHECK_OPERATION_STATUS_RETURN(AddSplitQKVRmsNormRopeNode(param, opGraph, tensorMap));
+            } else {
+                CHECK_OPERATION_STATUS_RETURN(AddSplitQKVNode(param, opGraph, tensorMap));
+                if (param.useQKNorm) {
+                    CHECK_OPERATION_STATUS_RETURN(AddQKNormNode(param, opGraph, tensorMap));
+                }
             }
         } else if (isPack && !param.isGroupedQueryAttention) {  // Split MHA
             CHECK_OPERATION_STATUS_RETURN(AddSplitMixedQKVNode(param, opGraph, tensorMap));
