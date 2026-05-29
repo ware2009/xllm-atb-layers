@@ -19,6 +19,15 @@
 
 namespace atb_speed {
 
+namespace {
+constexpr int32_t VECTOR_CORE_NUM = 32;
+
+bool IsPowerOfTwo(int32_t value)
+{
+    return value > 0 && (value & (value - 1)) == 0;
+}
+} // namespace
+
 SplitRmsnormRopeOperation::SplitRmsnormRopeOperation(
     const std::string &name, SplitRmsnormRopeParam param) : name_(name), param_(param)
 {}
@@ -122,8 +131,31 @@ atb::Status SplitRmsnormRopeOperation::Setup(const atb::VariantPack &variantPack
 atb::Status SplitRmsnormRopeOperation::Execute(const atb::VariantPack &variantPack, uint8_t *workspace, uint64_t workspaceSize, atb::Context* context)
 {
     ATB_SPEED_LOG_INFO("SplitRmsnormRopeOperation Execute start");
-    int32_t gridX = static_cast<int32_t>(variantPack.inTensors.at(0).desc.shape.dims[0]);
-    int32_t gridY = static_cast<int32_t>(variantPack.inTensors.at(0).desc.shape.dims[1] / param_.headDim);
+    int32_t batchSize = static_cast<int32_t>(variantPack.inTensors.at(0).desc.shape.dims[0]);
+    int32_t inputHiddenSize = static_cast<int32_t>(variantPack.inTensors.at(0).desc.shape.dims[1]);
+    int32_t sinHeadDim = static_cast<int32_t>(variantPack.inTensors.at(1).desc.shape.dims[1]);
+    int32_t cosHeadDim = static_cast<int32_t>(variantPack.inTensors.at(2).desc.shape.dims[1]);
+    if (!IsPowerOfTwo(param_.headDim) || param_.qHiddenSize % param_.kvHiddenSize != 0 ||
+        param_.kvHiddenSize % param_.headDim != 0 ||
+        inputHiddenSize != param_.qHiddenSize + 2 * param_.kvHiddenSize ||
+        sinHeadDim != param_.headDim || cosHeadDim != param_.headDim) {
+        std::stringstream ss;
+        ss << "invalid split rmsnorm rope shape, inputHiddenSize: " << inputHiddenSize
+           << ", qHiddenSize: " << param_.qHiddenSize << ", kvHiddenSize: " << param_.kvHiddenSize
+           << ", headDim: " << param_.headDim << ", sinHeadDim: " << sinHeadDim
+           << ", cosHeadDim: " << cosHeadDim;
+        ATB_SPEED_LOG_ERROR(ss.str());
+        return atb::ERROR_INVALID_PARAM;
+    }
+    int32_t gridY = static_cast<int32_t>(param_.kvHiddenSize / param_.headDim);
+    if (gridY <= 0 || VECTOR_CORE_NUM % gridY != 0) {
+        std::stringstream ss;
+        ss << "invalid gridY: " << gridY << ", kvHiddenSize: " << param_.kvHiddenSize
+           << ", headDim: " << param_.headDim;
+        ATB_SPEED_LOG_ERROR(ss.str());
+        return atb::ERROR_INVALID_PARAM;
+    }
+    int32_t gridX = VECTOR_CORE_NUM / gridY;
     int32_t gridZ = param_.gridZ;
     std::string kernelName = GenerateKernelName();
 
@@ -139,7 +171,7 @@ atb::Status SplitRmsnormRopeOperation::Execute(const atb::VariantPack &variantPa
                          nullptr,
                          variantPack.inTensors.at(4).deviceData,
                          nullptr,
-                         gridX);
+                         batchSize);
     });
     if (ret != 0) {
         std::stringstream ss;
