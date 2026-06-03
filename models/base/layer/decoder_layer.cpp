@@ -849,6 +849,7 @@ void DecoderLayer<NormType>::SetMlpParam(atb_speed::common::MlpParam<NormType> &
     mlpParam.layerLinearDescs = this->param.linearDescs;
     mlpParam.packQuantType = this->param.packQuantType.at(1);
     mlpParam.matmulBackend = this->param.matmulBackend;
+    mlpParam.swigluBackend = this->param.swigluBackend;
     mlpParam.quantGroupSize = this->param.quantGroupSize;
     mlpParam.isEdgeHardware = this->param.isEdgeHardware;
     mlpParam.enableFlashComm = param.enableFlashComm;
