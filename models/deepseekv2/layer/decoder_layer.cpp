@@ -15,6 +15,7 @@
  */
 
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 #include "operations/fusion/linear/linear.h"
 #include "operations/fusion/linear/linear_parallel.h"
 #include "operations/fusion/norm/norm_linear.h"
@@ -147,7 +148,9 @@ std::map<std::string, std::vector<std::string>> GetDeepseekV2LayerInTensorCandid
             "in_prefix_slots"
         }},
 	{"indexer_intensor", {
-            "in_k_cache_indexer", "in_seq_len_query"}}
+            "in_k_cache_indexer", "in_seq_len_query"}},
+        {"topk_share", {
+            "in_shared_topk_indices"}}
     };
     SetDeepseekV2LayerInTensorDefaultCandidates(deepseekV2LayerInTensorCandidates);
     return deepseekV2LayerInTensorCandidates;
@@ -246,6 +249,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(
     if (!param.isDenseLayer && param.enableExpertCumSumOutput) {
         outTensorList.push_back("out_gmm_cumsum_list");
     }
+    if (param.outputTopk) {
+        outTensorList.push_back("out_topk_indices");
+    }
 
     atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "default_weight", inTensorList);
     if (param.index_n_heads > 0) {
@@ -266,6 +272,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(
     atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "parallel_input", inTensorList);
     if (param.index_n_heads > 0) {
         atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "indexer_intensor", inTensorList);
+    }
+    if (param.skipTopk) {
+        atb_speed::common::AddTensorToList(deepseekV2InTensorCandidates, "topk_share", inTensorList);
     }
     if (param.mapping.Get(base::ATTN_CP).IsEnabled() && param.isPrefill) {
         if (param.index_n_heads > 0) {
@@ -453,6 +462,8 @@ atb::Status SetLatentAttentionParam(
     latentAttentionParam.index_head_dim = param.index_head_dim;
     latentAttentionParam.index_n_heads = param.index_n_heads;
     latentAttentionParam.index_topk = param.index_topk;
+    latentAttentionParam.skipTopk = param.skipTopk;
+    latentAttentionParam.outputTopk = param.outputTopk;
     latentAttentionParam.selfAttentionParam.headNum = param.numAttentionHeadsPerRank;
     latentAttentionParam.selfAttentionParam.kvHeadNum = param.numAttentionHeadsPerRank;
     CHECK_PARAM_GT(param.hiddenSizePerAttentionHead, 0);
@@ -577,6 +588,9 @@ int64_t SetAttention(atb::GraphParam &opGraph, const DecoderLayerParam &param,
     if (param.index_n_heads > 0) {
         atb_speed::common::AddTensorToList(GetDeepseekV2LayerInTensorCandidates(), "indexer_intensor", attnInTensorNames);
     }
+    if (param.skipTopk) {
+        atb_speed::common::AddTensorToList(GetDeepseekV2LayerInTensorCandidates(), "topk_share", attnInTensorNames);
+    }
     if (param.enablePrefixCache) {
         atb_speed::common::AddTensorToList(GetDeepseekV2LayerInTensorCandidates(), "prefixcache", attnInTensorNames);
     }
@@ -603,8 +617,14 @@ int64_t SetAttention(atb::GraphParam &opGraph, const DecoderLayerParam &param,
         attnInTensorNames.push_back("in_seq_len_sp");
     }
     attentionNode.inTensorIds = atb_speed::common::GetTensorIdxList(tensorMap, attnInTensorNames);
-    attentionNode.outTensorIds = atb_speed::common::GetTensorIdxList(tensorMap, {is_auxiliary ? 
-        "intermediate_attention_out_auxiliary" : "intermediate_attention_out"});
+    std::vector<std::string> attnOutTensorNames = {
+        is_auxiliary ? "intermediate_attention_out_auxiliary" :
+                       "intermediate_attention_out"};
+    if (!is_auxiliary && param.outputTopk) {
+        attnOutTensorNames.push_back("out_topk_indices");
+    }
+    attentionNode.outTensorIds =
+        atb_speed::common::GetTensorIdxList(tensorMap, attnOutTensorNames);
 
     if (stream_id) {
         atb::SetExecuteStreamId(attentionNode.operation, stream_id);
@@ -1903,6 +1923,16 @@ atb::Status DecoderLayer(DecoderLayerParam &param, atb::Operation **operation)
     CalculateDataPartition(param);
     CalculateCommType(param);
     param.enableQkvdownDp = param.enableQkvdownDp && param.ffnAllGather;
+    CHECK(!(param.skipTopk || param.outputTopk) || param.index_n_heads > 0)
+        << "DSA top-k sharing requires index_n_heads > 0.";
+    CHECK(!(param.skipTopk && param.outputTopk))
+        << "DSA top-k sharing does not support skip and output in the same layer.";
+    const bool isCpPrefill = param.mapping.Get(base::ATTN_CP).IsEnabled() && param.isPrefill;
+    // TODO: support DSA top-k sharing for CP prefill.
+    CHECK(!((param.skipTopk || param.outputTopk) && isCpPrefill))
+        << "DSA top-k sharing does not support CP prefill yet.";
+    CHECK(!(param.outputTopk && param.isPrefill && FLAGS_enable_multi_stream_parallel))
+        << "DSA top-k sharing does not support multi stream prefill yet.";
     std::map<std::string, uint32_t> tensorMap = ConstructTensorMap(
         param, opGraph.inTensorNum, opGraph.outTensorNum, opGraph.internalTensorNum);
     ATB_SPEED_LOG_DEBUG("layer graph inTensorNum: " << opGraph.inTensorNum);
@@ -1967,6 +1997,18 @@ atb::Status DecoderLayer(DecoderLayerParam &param, atb::Operation **operation)
             outTensorDescs.at(1).shape.dimNum = 1;
             outTensorDescs.at(1).dtype = ACL_INT64;
             outTensorDescs.at(1).shape.dims[0] = param.numOfDeviceExperts;
+        }
+        if (param.outputTopk) {
+            const size_t topkOutIdx = outTensorDescs.size() - 1;
+            outTensorDescs.at(topkOutIdx) = atb::TensorDesc{};
+            outTensorDescs.at(topkOutIdx).format = ACL_FORMAT_ND;
+            outTensorDescs.at(topkOutIdx).dtype = ACL_INT32;
+            outTensorDescs.at(topkOutIdx).shape.dimNum = 3;
+            outTensorDescs.at(topkOutIdx).shape.dims[0] = inTensorDescs.at(
+                atb_speed::common::GetTensorIdx(tensorMap, "in_hidden_states")).shape.dims[0];
+            outTensorDescs.at(topkOutIdx).shape.dims[1] = inTensorDescs.at(
+                atb_speed::common::GetTensorIdx(tensorMap, "in_k_cache_indexer")).shape.dims[2];
+            outTensorDescs.at(topkOutIdx).shape.dims[2] = param.index_topk;
         }
         return atb::NO_ERROR;
     };

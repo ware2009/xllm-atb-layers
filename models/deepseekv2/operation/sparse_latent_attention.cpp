@@ -104,6 +104,7 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnInTensorCandidates(
         {"attn_inner_sp_decode", {"in_seq_len_sp"}},
         {"qkvdown_dp", {"in_ffn_unpadding_idx"}
         },
+        {"topk_share", {"in_shared_topk_indices"}},
         {"cp_prefixcache", {
             "in_prefix_slots"
         }},
@@ -131,9 +132,11 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
                 "intermediate_indexer_qa_norm", "intermediate_indexer_qb", "indexer_rope_q", "indexer_nope_q",
                 "intermediate_indexer_k", "intermediate_indexer_k_norm", "indexer_rope_k", "indexer_nope_k", "indexer_rope_q_o", "indexer_rope_k_o",
                 "intermediate_indexer_q_out", "intermediate_indexer_k_out", "intermediate_indexer_input_norm",
-                "intermediate_indexer_weight_out", "intermediate_topk_indices", "intermediate_reproj_t"
+                "intermediate_indexer_weight_out"
             }
         },
+        {"indexer_skipped", {"intermediate_indexer_qa_norm"}},
+        {"ein_reproj", {"intermediate_reproj_t"}},
         {"orpoj_transpose", {"intermediate_sfa_out", "intermediate_reproj"}},
         {"decode", {"reproj_nope_q", "reproj_o"}},
         {"q_lora", {"latent_qkv", "latent_q_norm", "q_lora_out"}},
@@ -214,6 +217,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
 {
     std::vector<std::string> inTensorList = {};
     std::vector<std::string> outTensorList = {"out"};
+    if (param.outputTopk) {
+        outTensorList.push_back("out_topk_indices");
+    }
     std::vector<std::string> intermediateTensorList = {};
     auto latentAttnInTensorCandidates = GetLatentAttnInTensorCandidates();
     auto latentAttnIntermediateTensorCandidates = GetLatentAttnIntermediateTensorCandidates();
@@ -231,6 +237,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
     }
     if (param.enableMlaPreprocess && !param.isPrefill) {
         AddTensorToList(latentAttnIntermediateTensorCandidates, "mla_preprocess", intermediateTensorList);
+        if (param.skipTopk) {
+            AddTensorToList(latentAttnIntermediateTensorCandidates, "indexer_skipped", intermediateTensorList);
+        }
     } else {
         AddTensorToList(latentAttnIntermediateTensorCandidates, "default", intermediateTensorList);
         if (param.qLoraRank != 0) {
@@ -250,7 +259,15 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
             AddTensorToList(latentAttnIntermediateTensorCandidates, "decode", intermediateTensorList);
         }
     }
-    AddTensorToList(latentAttnIntermediateTensorCandidates, "indexer", intermediateTensorList);    
+    if (!param.skipTopk) {
+        AddTensorToList(latentAttnIntermediateTensorCandidates, "indexer", intermediateTensorList);
+        if (!param.outputTopk) {
+            intermediateTensorList.push_back("intermediate_topk_indices");
+        }
+    } else {
+        AddTensorToList(latentAttnInTensorCandidates, "topk_share", inTensorList);
+    }
+    AddTensorToList(latentAttnIntermediateTensorCandidates, "ein_reproj", intermediateTensorList);
     // using MATMUL_EIN_SUM, skip trans
     // AddTensorToList(latentAttnIntermediateTensorCandidates, "orpoj_transpose", intermediateTensorList);
 
@@ -1826,7 +1843,9 @@ atb::Status AddLightIndexerNode(const LatentAttentionParam<NormParamType> &param
         GetTensorIdx(tensorMap, "in_seq_len"),
         GetTensorIdx(tensorMap, "in_block_tables"),
     };
-    lightIndexerNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_topk_indices")};
+    lightIndexerNode.outTensorIds = {GetTensorIdx(
+        tensorMap,
+        param.outputTopk ? "out_topk_indices" : "intermediate_topk_indices")};
     opGraph.nodes.push_back(lightIndexerNode);
     ATB_SPEED_LOG_DEBUG("LightningIndexer calculation success");
     return atb::NO_ERROR;
@@ -1856,11 +1875,15 @@ atb::Status AddSparseFlashAttentionNode(
         q_nope = "intermediate_q_nope";
         q_pe = "intermediate_q_rope";
     }
+    std::string topk_indices =
+        param.skipTopk ? "in_shared_topk_indices"
+                       : (param.outputTopk ? "out_topk_indices"
+                                           : "intermediate_topk_indices");
     sparseFlashAttentionNode.inTensorIds = {
         GetTensorIdx(tensorMap, q_nope),
         GetTensorIdx(tensorMap, "in_k_cache"),
         GetTensorIdx(tensorMap, "in_k_cache"),
-        GetTensorIdx(tensorMap, "intermediate_topk_indices"),
+        GetTensorIdx(tensorMap, topk_indices),
         GetTensorIdx(tensorMap, "in_block_tables"),
         GetTensorIdx(tensorMap, "in_seq_len_query"),
         GetTensorIdx(tensorMap, "in_seq_len"),
@@ -2089,28 +2112,33 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
             CHECK_OPERATION_STATUS_RETURN(PreprocessKV(param, opGraph, tensorMap));
         }
         CHECK_OPERATION_STATUS_RETURN(AddReshapeAndCacheNode(param, opGraph, tensorMap));
+    }
+    if (!param.skipTopk) {
+        // indexer
         CHECK_OPERATION_STATUS_RETURN(AddLAttnQNormRecalNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddIndexerQBNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddIndexerQBSplitNode(param, opGraph, tensorMap));
+
+        CHECK_OPERATION_STATUS_RETURN(AddIndexerInputNormRecalNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddIndexerKNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddIndexerKNormNode(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(AddIndexerKSplitNode(param, opGraph, tensorMap));
+
+        CHECK_OPERATION_STATUS_RETURN(AddIndexerQKRopeNode(param, opGraph, tensorMap));
+
+        CHECK_OPERATION_STATUS_RETURN(AddIndexerQKCatNode(param, opGraph, tensorMap));
+        // "intermediate_indexer_k_out"
+
+        if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+            CHECK_OPERATION_STATUS_RETURN(AddSfaAllGatherAndReorderCpNode(param, opGraph, tensorMap,
+                "intermediate_indexer_k_out", "indexer_k_out_allgather", "indexer_k_out_allgather_s", "cp_kv_recover_idx"));
+        }
+        CHECK_OPERATION_STATUS_RETURN(AddIndexerKReshapeAndCacheNode(param, opGraph, tensorMap));
+    } else {
+        // TODO: support DSA top-k sharing for CP prefill.
+        CHECK(!(param.contextParallelInfo.IsEnabled() && param.isPrefill))
+            << "DSA top-k sharing does not support CP prefill yet.";
     }
-    // indexer
-    // CHECK_OPERATION_STATUS_RETURN(AddLAttnQNormRecalNode(param, opGraph, tensorMap));
-    CHECK_OPERATION_STATUS_RETURN(AddIndexerQBNode(param, opGraph, tensorMap));
-    CHECK_OPERATION_STATUS_RETURN(AddIndexerQBSplitNode(param, opGraph, tensorMap));
-    
-    CHECK_OPERATION_STATUS_RETURN(AddIndexerInputNormRecalNode(param, opGraph, tensorMap));
-    CHECK_OPERATION_STATUS_RETURN(AddIndexerKNode(param, opGraph, tensorMap));
-    CHECK_OPERATION_STATUS_RETURN(AddIndexerKNormNode(param, opGraph, tensorMap));
-    CHECK_OPERATION_STATUS_RETURN(AddIndexerKSplitNode(param, opGraph, tensorMap));
-
-    CHECK_OPERATION_STATUS_RETURN(AddIndexerQKRopeNode(param, opGraph, tensorMap));
-
-    CHECK_OPERATION_STATUS_RETURN(AddIndexerQKCatNode(param, opGraph, tensorMap));
-    // "intermediate_indexer_k_out"
-
-    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
-        CHECK_OPERATION_STATUS_RETURN(AddSfaAllGatherAndReorderCpNode(param, opGraph, tensorMap,
-            "intermediate_indexer_k_out", "indexer_k_out_allgather", "indexer_k_out_allgather_s", "cp_kv_recover_idx"));
-    }
-    CHECK_OPERATION_STATUS_RETURN(AddIndexerKReshapeAndCacheNode(param, opGraph, tensorMap));
 
     // CP + PrefixCache: load prefix from cache, AllGather, and Concat with current.
     // Each Concat's current-branch tensor has a different dim count:
@@ -2161,7 +2189,9 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
             indexer_prefix_src, "indexer_k_out_allgather_s", "merged_indexer_k"));
     }
 
-    CHECK_OPERATION_STATUS_RETURN(AddIndexerWeightNode(param, opGraph, tensorMap));
+    if (!param.skipTopk) {
+        CHECK_OPERATION_STATUS_RETURN(AddIndexerWeightNode(param, opGraph, tensorMap));
+    }
 
     if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
         // q/weight rerank - "cp_load_balance_idx"
@@ -2184,13 +2214,12 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
         CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
             indexer_k_source, "indexer_k_out_next", "k_gather_index_next"));
         CHECK_OPERATION_STATUS_RETURN(AddLightIndexerCpNode(param, opGraph, tensorMap));
-            //intermediate_topk_indices_prev_cat intermediate_topk_indices_next_cat
+        // intermediate_topk_indices_prev_cat intermediate_topk_indices_next_cat
 
         // index & cat & rerank - "cp_o_recover_idx"
         CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
             "intermediate_topk_indices_draft", "intermediate_topk_indices", "cp_o_recover_idx"));
-    }
-    else{
+    } else if (!param.skipTopk) {
         CHECK_OPERATION_STATUS_RETURN(AddLightIndexerNode(param, opGraph, tensorMap));
     }
     return atb::NO_ERROR;
@@ -2236,6 +2265,16 @@ atb::Status SparseAttention(const LatentAttentionParam<NormParamType> &param, at
         if (param.enableOutLcocTp) {
             outTensorDescs.at(0).shape.dims[0] = inTensorDescs.at(atb_speed::common::GetTensorIdx(tensorMap,
                 "in_attn_padding_idx")).shape.dims[0] / param.attnTpSize;
+        }
+        if (param.outputTopk) {
+            outTensorDescs.at(1) = atb::TensorDesc{};
+            outTensorDescs.at(1).format = ACL_FORMAT_ND;
+            outTensorDescs.at(1).dtype = ACL_INT32;
+            outTensorDescs.at(1).shape.dimNum = 3;
+            outTensorDescs.at(1).shape.dims[0] = inTensorDescs.at(0).shape.dims[0];
+            outTensorDescs.at(1).shape.dims[1] = inTensorDescs.at(
+                atb_speed::common::GetTensorIdx(tensorMap, "in_k_cache_indexer")).shape.dims[2];
+            outTensorDescs.at(1).shape.dims[2] = param.index_topk;
         }
         return atb::NO_ERROR;
     };

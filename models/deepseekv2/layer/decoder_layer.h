@@ -71,6 +71,8 @@ public:
     int index_head_dim = 0; // 128
     int index_n_heads = 0; // 64
     int index_topk = 0; // 2048
+    bool skipTopk = false;
+    bool outputTopk = false;
     // translated
     int attnStreamNum = 1;
     int ffnStreamNum = 1;

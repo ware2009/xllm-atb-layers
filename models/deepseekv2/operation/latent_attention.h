@@ -65,6 +65,8 @@ struct LatentAttentionParam {
     int index_head_dim = 0; // 128
     int index_n_heads = 0; // 64
     int index_topk = 0; // 2048
+    bool skipTopk = false;
+    bool outputTopk = false;
 
     int packQuantType = atb_speed::common::PackQuantType::ALL_FP;
     std::vector<int> attnLinearQuantType = {};
