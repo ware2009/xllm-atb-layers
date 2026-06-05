@@ -415,6 +415,19 @@ void SetAttnCpParam(
     }
 }
 
+void SetAttnKvSplitParam(
+    atb_speed::deepseekV2::LatentAttentionParam<atb::infer::RmsNormParam> &latentAttentionParam,
+    const DecoderLayerParam &param)
+{
+    if (!param.mapping.Has(base::ATTN_KV_SPLIT)) {
+        return;
+    }
+    const atb_speed::common::ParallelInfo &kvSplit = param.mapping.Get(base::ATTN_KV_SPLIT);
+    if (kvSplit.IsEnabled()) {
+        latentAttentionParam.kvSplitInfo = kvSplit;
+    }
+}
+
 void SetAttnInnerSpParam(
     atb_speed::deepseekV2::LatentAttentionParam<atb::infer::RmsNormParam> &latentAttentionParam,
     const DecoderLayerParam &param)
@@ -508,6 +521,7 @@ atb::Status SetLatentAttentionParam(
     latentAttentionParam.isNzCache = param.isNzCache;
     // This function must be called after the pageAttentionParam is set. It will change pageAttentionParam.headNum
     SetAttnCpParam(latentAttentionParam, param);
+    SetAttnKvSplitParam(latentAttentionParam, param);
     SetAttnInnerSpParam(latentAttentionParam, param);
     SetLatentAttentionInnerCommParam(latentAttentionParam, param);
     latentAttentionParam.enableQkvdownDp = param.enableQkvdownDp && param.layerId > param.firstKDenseReplace;
@@ -532,15 +546,6 @@ atb::Status SetLatentAttentionParam(
     latentAttentionParam.enablePrefixCache = param.enablePrefixCache;
     latentAttentionParam.enablePrefixCacheCP = param.enablePrefixCacheCP;
     latentAttentionParam.enablePrefixCacheLocal = param.enablePrefixCacheLocal;
-    // kvSplitInfo defaults to "empty" (IsEnabled() == false), in which case
-    // SparseLatentAttention falls back to contextParallelInfo for the prefix
-    // AllGather - that is the legacy (kv_split_size == cp_size) behavior.
-    // When the xLLM framework wants to override the KV-split group it must
-    // populate this directly from MappingNPU::to_json()["kvSplit"]; today we
-    // intentionally leave it empty so the upstream switch is only flipped via
-    // `enablePrefixCacheLocal` (kv_split_size == 1 case). Future work will
-    // wire kvSplitInfo through `base::Mapping` once a dedicated enum slot is
-    // added on the atb_speed side.
     latentAttentionParam.normEps = param.normEps;
     latentAttentionParam.softmaxScale = param.softmaxScale;
     return atb::NO_ERROR;

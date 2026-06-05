@@ -61,6 +61,7 @@ enum ParallelType : uint32_t {
     MOE_TP,
     MOE_EP,
     LCOC_ATTN_TP,
+    ATTN_KV_SPLIT,
     PARALLEL_TYPE_END,
 };
 
@@ -83,6 +84,8 @@ public:
     /// \throw Throws out of range error if key `parallelType` is not in `parallelStrategies_`
     /// \return a `ParallelInfo` object corresponding to the parallelism strategy of the target module
     const atb_speed::common::ParallelInfo Get(ParallelType parallelType) const;
+    /// Whether a parallelism strategy was registered during ParseParam
+    bool Has(ParallelType parallelType) const;
     /// Initialize the communication group of each parallelism strategy
     /// \param defaultBackend The communication bacekdn
     /// \return A flag indicating whether the communication domain is created successfully
