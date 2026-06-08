@@ -56,6 +56,19 @@ void Mapping::ParseParam(const nlohmann::json &paramJson)
         parallelInfo.groupId = FetchJsonParam<uint32_t>(curParamJson, "groupId");
         this->Register(it->first, parallelInfo);
     }
+    // KV-split group (independent from token-CP). Emitted by xLLM MappingNPU as
+    // "kvSplit". When absent (legacy mapping JSON) SparseLatentAttention keeps
+    // using contextParallelInfo for the prefix AllGather.
+    if (paramJson.contains("kvSplit")) {
+        atb_speed::common::ParallelInfo kvSplitInfo = atb_speed::common::ParallelInfo();
+        const nlohmann::json &kvSplitJson = paramJson["kvSplit"];
+        kvSplitInfo.rank = FetchJsonParam<uint32_t>(kvSplitJson, "rank");
+        kvSplitInfo.rankIds =
+            FetchJsonParam<std::vector<uint32_t>>(kvSplitJson["rankIds"], "rankIds", true);
+        kvSplitInfo.bufferSize = FetchJsonParam<uint32_t>(kvSplitJson, "bufferSize");
+        kvSplitInfo.groupId = FetchJsonParam<uint32_t>(kvSplitJson, "groupId");
+        this->Register(ATTN_KV_SPLIT, kvSplitInfo);
+    }
 }
 
 void Mapping::InitGlobalCommDomain(std::string defaultBackend)
@@ -81,6 +94,11 @@ uint32_t Mapping::localWorldSize() const { return localWorldSize_; }
 void Mapping::Register(ParallelType parallelType, atb_speed::common::ParallelInfo parallelInfo)
 {
     this->parallelStrategies_[parallelType] = parallelInfo;
+}
+
+bool Mapping::Has(ParallelType parallelType) const
+{
+    return this->parallelStrategies_.find(parallelType) != this->parallelStrategies_.end();
 }
 
 const atb_speed::common::ParallelInfo Mapping::Get(ParallelType parallelType) const
