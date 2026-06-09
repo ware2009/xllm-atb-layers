@@ -2057,7 +2057,8 @@ template <typename NormParamType>
 atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
     atb::GraphParam &opGraph, std::map<std::string, uint32_t> &tensorMap)
 {   
-    if (param.qLoraRank > 0 && param.enableMlaPreprocess && !param.isPrefill) {
+    const bool useMlaPreprocess = param.qLoraRank > 0 && param.enableMlaPreprocess && !param.isPrefill;
+    if (useMlaPreprocess) {
         CHECK_OPERATION_STATUS_RETURN(AddMlaPreprocessV2Node(param, opGraph, tensorMap));
         // indexer
         // CHECK_OPERATION_STATUS_RETURN(AddLAttnPreNormNode(param, opGraph, tensorMap)); //strictly copy
@@ -2115,7 +2116,9 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
     }
     if (!param.skipTopk) {
         // indexer
-        CHECK_OPERATION_STATUS_RETURN(AddLAttnQNormRecalNode(param, opGraph, tensorMap));
+        if (!useMlaPreprocess) {
+            CHECK_OPERATION_STATUS_RETURN(AddLAttnQNormRecalNode(param, opGraph, tensorMap));
+        }
         CHECK_OPERATION_STATUS_RETURN(AddIndexerQBNode(param, opGraph, tensorMap));
         CHECK_OPERATION_STATUS_RETURN(AddIndexerQBSplitNode(param, opGraph, tensorMap));
 
