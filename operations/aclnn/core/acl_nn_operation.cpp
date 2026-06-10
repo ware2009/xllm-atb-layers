@@ -156,7 +156,7 @@ atb::Status AclNNOperation::CreateAclNNOpCache(const atb::VariantPack &variantPa
     ret = aclSetAclOpExecutorRepeatable(this->aclnnOpCache_->aclExecutor);
     if (ret != 0) {
         // translated,translatedLocal Cachetranslatedexecutortranslated
-        ATB_SPEED_LOG_WARN(this->opName_ << " call aclSetAclOpExecutorRepeatable fail: " << ret);
+        ATB_SPEED_LOG_DEBUG(this->opName_ << " call aclSetAclOpExecutorRepeatable fail: " << ret);
         this->aclnnOpCache_->executorRepeatable = false;
     } else {
         // translated,translatedLocal Cachetranslatedexecutortranslated
