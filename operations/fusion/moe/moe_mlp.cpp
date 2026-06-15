@@ -378,7 +378,7 @@ atb::Status CreateInitRoutingV3NoQuant(
     initRoutingParam.scaledTopk = param.scaledTopk;
     initRoutingParam.enableInitRoutingCutoff = param.enableInitRoutingCutoff;
     initRoutingParam.expertNum = param.numOfExperts;
-    initRoutingParam.expertTokensNumType = 2;
+    initRoutingParam.expertTokensNumType = 1;
     initRoutingParam.quantMode = -1;
 
     initRoutingNode.operation = new atb_speed::common::MoeInitRoutingV3Operation("MoeInitRoutingOperation", initRoutingParam);
@@ -725,6 +725,7 @@ atb::Status CreateGmm1(std::map<std::string, uint32_t> &tensorMap,
     gmmParam.packQuantType = param.packQuantType;
     gmmParam.transposeB = param.downTransposeB;
     gmmParam.enableIndexGmm = param.enableIndexGmm;
+    gmmParam.enableInitRoutingV3 = param.enableInitRoutingV3;
     if (param.packQuantType == atb_speed::common::PackQuantType::ALL_W4A8) {
         gmmParam.hasBias = true;
     }
@@ -1128,8 +1129,8 @@ atb::Status CreateFusedRouting(
 	// quant + init routing v3
 	CHECK_OPERATION_STATUS_RETURN(CreateGmm(tensorMap, opGraph, param));
     } else if (param.enableInitRoutingV3) {
-	// no quant + init routing v3
-	CHECK_OPERATION_STATUS_RETURN(CreateCustomGmmWeightNZ(tensorMap, opGraph, param));
+        // no quant + init routing v3
+        CHECK_OPERATION_STATUS_RETURN(CreateGmm(tensorMap, opGraph, param));
     } else{
 	// no quant
 	CHECK_OPERATION_STATUS_RETURN(CreateGmm(tensorMap, opGraph, param));
@@ -1143,10 +1144,10 @@ atb::Status CreateFusedRouting(
     }
 
     if (!isGMMSwigluQuant){
-	if (!param.enableInitQuant && param.enableInitRoutingV3){
-            // no-quant && initRoutingV3
-            CHECK_OPERATION_STATUS_RETURN(CreateActivationBlock(tensorMap, param, opGraph));
-            CHECK_OPERATION_STATUS_RETURN(CreateCustomGmm1WeightNZ(tensorMap, opGraph, param));
+		if (!param.enableInitQuant && param.enableInitRoutingV3){
+	            // no-quant && initRoutingV3
+	            CHECK_OPERATION_STATUS_RETURN(CreateActivationBlock(tensorMap, param, opGraph));
+	            CHECK_OPERATION_STATUS_RETURN(CreateGmm1(tensorMap, opGraph, param));
     	} else {
             // quant && initRoutingV3
             // default

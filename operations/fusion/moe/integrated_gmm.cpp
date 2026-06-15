@@ -262,6 +262,9 @@ atb::Status CreateGmm(std::map<std::string, uint32_t> &tensorMap, atb::GraphPara
     gmmParam.transposeB = param.transposeB;
     gmmParam.hasBias = param.hasBias;
     gmmParam.enableIndexGmm = param.enableIndexGmm;
+    if (param.enableInitRoutingV3) {
+       gmmParam.groupListType = gmmQuantType == GmmQuantType::W8A8_TOKEN ? 2 : 1;
+    }
     if (param.enableGMMSwigluQuant) {
         if (param.enableInitRoutingV3) {
            atb_speed::common::AclNNMoeGroupedSwigluMatmulParam gmmSwigluParam;
@@ -328,7 +331,7 @@ atb::Status CreateGmm1(std::map<std::string, uint32_t> &tensorMap,
     gmmParam.hasBias = param.hasBias;
     gmmParam.enableIndexGmm = param.enableIndexGmm;
     if (param.enableInitRoutingV3) {
-       gmmParam.groupListType = 2;
+       gmmParam.groupListType = gmmQuantType == GmmQuantType::W8A8_TOKEN ? 2 : 1;
     }
     ATB_SPEED_LOG_DEBUG("Calc GmmQuantType success");
     gmmNode.operation = new atb_speed::common::GroupedMatmulOperation("gmmNode1", gmmParam);
