@@ -34,6 +34,10 @@ struct AclNNVariantPack {
     /// A container stores an AclNN operation's output `aclTensorList` in order.
     /// Each `aclTensorList` object may contain multiple `aclTensor`.
     atb::SVector<aclTensorList *> aclOutTensorList;
+    /// A container stores auxiliary `aclTensor` objects that are created outside
+    /// the standard in/out tensors (e.g. an operator's extra workspace output).
+    /// They are owned by the cache and released in `Destroy()`.
+    atb::SVector<aclTensor *> aclAuxTensors;
 };
 
 /// AclNNOpCache stores information of an operation that can be reused between operations.

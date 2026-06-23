@@ -21,6 +21,25 @@ namespace atb_speed {
 namespace common {
 
 
+int ExecutorManager::RegisterReference(aclOpExecutor *executor)
+{
+    std::map<aclOpExecutor *, int>::iterator it = this->executorCount_.find(executor);
+    if (it != this->executorCount_.end()) {
+        // The address is already tracked. Since a live executor's address can
+        // never be reissued by the allocator, this is a stale entry left by a
+        // previously destroyed executor whose address has been reused (ABA).
+        // Discard the stale count and start fresh to avoid an inflated count
+        // that would never reach zero (which would leak the executor and all of
+        // its tensors).
+        ATB_SPEED_LOG_WARN("Plugin Op Cache: LEAKDBG stale reference count " << it->second
+            << " found for reused executor addr[" << executor << "], reset to 1 (ABA detected)");
+        it->second = 1;
+        return 1;
+    }
+    this->executorCount_[executor] = 1;
+    return 1;
+}
+
 int ExecutorManager::IncreaseReference(aclOpExecutor *executor)
 {
     std::map<aclOpExecutor *, int>::iterator it = this->executorCount_.find(executor);

@@ -26,20 +26,20 @@ void AclNNOpCache::Destroy()
     ATB_SPEED_LOG_DEBUG("Plugin Op Cache: AclNNOpCache addr [" << (this) << "]destroy");
     if (this->aclExecutor == nullptr) { return; }
 
-    // ExecutorManagertranslated1
-    int count = GetSingleton<ExecutorManager>().DecreaseReference(this->aclExecutor);
-    if (count != 0) { return; }  // translatedexecutortranslated0,translatedexecutortranslatedaclTensor
-
-    // translatedaclExecutortranslated0,translateddestroy
     int ret = -1;
-    ATB_SPEED_LOG_DEBUG("Plugin Op Cache: destroy Executor addr[" << this->aclExecutor << "]");
     if (this->executorRepeatable) {
-        // translatedexecutortranslated,translateddestroy;translateddestroy,translatedaclExecutortranslated
+        // Shared executor: only the holder that releases the last reference may
+        // destroy it. ExecutorManager tracks only repeatable executors.
+        int count = GetSingleton<ExecutorManager>().DecreaseReference(this->aclExecutor);
+        if (count != 0) { return; }  // still referenced elsewhere; keep alive
+        ATB_SPEED_LOG_DEBUG("Plugin Op Cache: destroy Executor addr[" << this->aclExecutor << "]");
         ret = aclDestroyAclOpExecutor(this->aclExecutor);
         if (ret != 0) {
             ATB_SPEED_LOG_ERROR("Plugin Op Cache: destroy Executor failed.");
         }
     }
+    // Non-repeatable executors are not tracked by ExecutorManager and are
+    // auto-released by CANN after execution; just drop our (dangling) handle.
     this->aclExecutor = nullptr;
 
     // translatedaclExecutortranslated
@@ -74,6 +74,12 @@ void AclNNOpCache::Destroy()
         if (ret != 0) { ATB_SPEED_LOG_ERROR("Plugin Op Cache: destroy aclOutTensorList " << i << " failed."); }
     }
     this->aclnnVariantPack.aclOutTensorList.clear();
+
+    for (size_t i = 0; i < this->aclnnVariantPack.aclAuxTensors.size(); ++i) {
+        ret = aclDestroyTensor(this->aclnnVariantPack.aclAuxTensors[i]);
+        if (ret != 0) { ATB_SPEED_LOG_ERROR("Plugin Op Cache: destroy aclAuxTensors " << i << " failed."); }
+    }
+    this->aclnnVariantPack.aclAuxTensors.clear();
 }
 
 atb::Status AclNNOpCache::UpdateAclNNVariantPack(const atb::VariantPack &variantPack)

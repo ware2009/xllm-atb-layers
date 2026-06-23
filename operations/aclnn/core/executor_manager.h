@@ -30,6 +30,17 @@ namespace common {
 /// when destroying an `aclOpExecutor` object, it's important to ensure that it no longer has any references.
 class ExecutorManager {
 public:
+    /// Register a freshly created `executor`, forcing its reference count to 1.
+    ///
+    /// A live executor's address can never be handed out again by the allocator,
+    /// so if the address is already tracked here it must be a stale entry left by
+    /// a destroyed executor whose address has been reused (the ABA problem). In
+    /// that case the stale count is discarded and reset to 1, and a warning is
+    /// logged. Use this at executor creation; use `IncreaseReference` for sharing.
+    ///
+    /// \param executor A freshly created `aclOpExecutor` object.
+    /// \return Always 1.
+    int RegisterReference(aclOpExecutor *executor);
     /// Increase the reference count of the input `executor` by 1.
     /// If the `executor` has no reference before, the reference count is set to 1.
     ///

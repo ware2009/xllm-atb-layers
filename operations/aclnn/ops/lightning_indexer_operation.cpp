@@ -115,6 +115,13 @@ int LightningIndexerOperation::SetAclNNWorkspaceExecutor()
                                               aclnnVariantPack.aclOutTensors.at(0)->tensor, // out
                                               tensor,                                      // sparseValuesOut
                                               &this->aclnnOpCache_->workspaceSize, &this->aclnnOpCache_->aclExecutor);
+    // sparseValuesOut is an auxiliary output not held by aclnnVariantPack's in/out
+    // tensors, so AclNNOpCache::Destroy() would otherwise never free it. Hand it to
+    // the cache so it is released together with the cache (on cache miss/eviction),
+    // avoiding a per-cache-miss host-side aclTensor leak.
+    if (tensor != nullptr) {
+        aclnnVariantPack.aclAuxTensors.push_back(tensor);
+    }
     ATB_SPEED_LOG_DEBUG(opName_ << " SetAclNNWorkspaceExecutor end"
                                 << ", ret: " << ret << ", workspaceSize: " << this->aclnnOpCache_->workspaceSize
                                 << ", aclExecutor: " << this->aclnnOpCache_->aclExecutor);

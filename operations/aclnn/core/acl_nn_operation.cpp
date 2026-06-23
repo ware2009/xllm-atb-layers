@@ -118,10 +118,16 @@ atb::Status AclNNOperation::UpdateAclNNOpCache(const atb::VariantPack &variantPa
     ATB_SPEED_LOG_DEBUG("Plugin Op Cache: Op name[" << this->opName_ << "] Op addr[" <<
         (this) << "] Cache addr[" << this->aclnnOpCache_.get() << "] Executor addr[" <<
         this->aclnnOpCache_->aclExecutor << "] create Local Cache");
-    // 3.3 translatedExecutorManager,translatedExecutor,counttranslated1
-    int count = GetSingleton<ExecutorManager>().IncreaseReference(this->aclnnOpCache_->aclExecutor);
-    ATB_SPEED_LOG_DEBUG("Plugin Op Cache: Op name[" << this->opName_ << "] increase Executor addr[" <<
-        this->aclnnOpCache_->aclExecutor << "] count update to " << count);
+    // 3.3 Only repeatable executors are shared (via local/global cache) and
+    // therefore need reference counting. Non-repeatable executors are owned by a
+    // single cache and auto-released by CANN after execution; keeping them out of
+    // ExecutorManager avoids stale map entries on reused addresses (the ABA
+    // problem that inflates counts and leaks executors + their tensors).
+    if (this->aclnnOpCache_->executorRepeatable) {
+        int count = GetSingleton<ExecutorManager>().RegisterReference(this->aclnnOpCache_->aclExecutor);
+        ATB_SPEED_LOG_DEBUG("Plugin Op Cache: Op name[" << this->opName_ << "] register Executor addr[" <<
+            this->aclnnOpCache_->aclExecutor << "] count update to " << count);
+    }
 
     // 3.4 translatedGlobal Cache(translatedGlobal Cachetranslated)
     GetSingleton<AclNNGlobalCache>().UpdateGlobalCache(this->opName_, this->aclnnOpCache_);
