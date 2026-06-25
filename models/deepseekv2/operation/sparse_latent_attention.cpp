@@ -37,6 +37,44 @@ namespace deepseekV2 {
 using namespace atb_speed::common;
 
 namespace sparse {
+constexpr uint64_t INDEXER_WQ_B_LINEAR_INDEX = 6;
+constexpr uint64_t INDEXER_WK_LINEAR_INDEX = 7;
+constexpr uint64_t INDEXER_PROJ_LINEAR_INDEX = 8;
+
+bool UseAttnLinearDesc(const std::vector<int> &attnLinearQuantType)
+{
+    // This field is backward-compatible: old callers pass LinearType, while
+    // newer callers can pass LinearDesc for per-linear quant selection.
+    for (int linearType : attnLinearQuantType) {
+        if (linearType >= LinearDesc::W4A16_DESC) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int GetLinearTransposeType(const std::vector<int> &transposeTypes, uint64_t index, int defaultValue)
+{
+    return index < transposeTypes.size() ? transposeTypes[index] : defaultValue;
+}
+
+template <typename NormParamType>
+LinearQuantType GetAttnLinearQuantType(
+    const LatentAttentionParam<NormParamType> &param, uint64_t linearIndex, bool hasNorm)
+{
+    bool useLinearDesc = UseAttnLinearDesc(param.attnLinearQuantType);
+    int linearDesc = useLinearDesc ? param.attnLinearQuantType[linearIndex] : LinearDesc::INVALID_DESC;
+    int linearType = useLinearDesc &&
+        (linearDesc == LinearDesc::FLOAT16_DESC || linearDesc == LinearDesc::BFLOAT16_DESC) ?
+        LinearType::FP : param.attnLinearQuantType[linearIndex];
+    return GetLinearQuantType(
+        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED ?
+            param.packQuantType : param.denseQuantType,
+        linearType,
+        hasNorm,
+        linearDesc);
+}
+
 template <typename NormParamType>
 bool EnableFA3Quant(const LatentAttentionParam<NormParamType> &param)
 {
@@ -144,25 +182,27 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
         {"mla_preprocess", {"intermediate_q_nope", "intermediate_self_attention", "intermediate_q_rope"}},
         {"kv_quant_scale", {"intermediate_kv_int8"}},
         {"attn_cp_prefill", {
-            "intermediate_kv_cp", "intermediate_kv_allgather", 
+            "intermediate_kv_cp", "intermediate_kv_allgather",
             "rope_k_o_cp", "rope_k_o_allgather",
             // "in_cos_embed_allgather", "in_cos_embed_allgather_s",
             // "in_sin_embed_allgather", "in_sin_embed_allgather_s",
-            "indexer_k_out_allgather", "indexer_k_out_allgather_s",
-            "indexer_q_out_balance", "indexer_weight_out_balance",
-            "indexer_q_out_prev", "indexer_q_out_next",
-            "indexer_weight_out_prev", "indexer_weight_out_next",
-            "indexer_k_out_prev", "indexer_k_out_next",
-            "intermediate_topk_indices_prev_cat", "intermediate_topk_indices_next_cat",
             "intermediate_topk_indices_balance", "intermediate_topk_indices_prev", "intermediate_topk_indices_next",
             "intermediate_topk_indices_balance_i64", "intermediate_topk_indices_prev_i64", "intermediate_topk_indices_next_i64",
-            "intermediate_topk_indices_draft",
             "intermediate_q_balance", "intermediate_q_prev", "intermediate_q_next",
             "rope_q_o_balance", "rope_q_o_prev", "rope_q_o_next",
             "intermediate_kv_prev", "intermediate_kv_next",
             "rope_k_o_prev", "rope_k_o_next",
             "intermediate_self_attention_prev", "intermediate_self_attention_next",
             "intermediate_self_attention_draft"
+        }},
+        {"attn_cp_prefill_indexer", {
+            "indexer_k_out_allgather", "indexer_k_out_allgather_s",
+            "indexer_q_out_balance", "indexer_weight_out_balance",
+            "indexer_q_out_prev", "indexer_q_out_next",
+            "indexer_weight_out_prev", "indexer_weight_out_next",
+            "indexer_k_out_prev", "indexer_k_out_next",
+            "intermediate_topk_indices_prev_cat", "intermediate_topk_indices_next_cat",
+            "intermediate_topk_indices_draft"
         }},
         {"attn_cp_decode", {"intermediate_go_lse_allgather"}},
         {"attn_inner_sp_decode", {
@@ -181,8 +221,10 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
         {"enable_fused_mla", {"rope_k_o_repeat", "intermediate_k_nope", "intermediate_v_mha", "temp_v_proj_b"}},
         // Tensors common to both prefix-cache modes (AllGather and local).
         {"cp_prefixcache", {
-            "prefix_kv", "prefix_k_rope", "prefix_indexer_k",
-            "merged_kv", "merged_k_rope", "merged_indexer_k"
+            "prefix_kv", "prefix_k_rope", "merged_kv", "merged_k_rope"
+        }},
+        {"cp_prefixcache_indexer", {
+            "prefix_indexer_k", "merged_indexer_k"
         }},
         // Extra tensors required only when the prefix AllGather runs (i.e.
         // enablePrefixCacheLocal == false). With local mode every CP rank
@@ -190,7 +232,10 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
         // these intermediate buffers entirely, saving HBM equal to
         // 3 * kvSplitSize * local_prefix_len * feature_dim.
         {"cp_prefixcache_allgather", {
-            "prefix_kv_allgather", "prefix_k_rope_allgather", "prefix_indexer_k_allgather"
+            "prefix_kv_allgather", "prefix_k_rope_allgather"
+        }},
+        {"cp_prefixcache_allgather_indexer", {
+            "prefix_indexer_k_allgather"
         }},
     };
     return latentAttnIntermediateTensorCandidates;
@@ -199,10 +244,7 @@ std::map<std::string, std::vector<std::string>> GetLatentAttnIntermediateTensorC
 template <typename NormParamType>
 bool UseExtraQuant(const LatentAttentionParam<NormParamType> &param, uint64_t linearIndex)
 {
-    LinearQuantType quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED \
-            ? param.packQuantType : param.denseQuantType,
-        param.attnLinearQuantType[linearIndex], true);
+    LinearQuantType quantType = GetAttnLinearQuantType(param, linearIndex, true);
     if (quantType == LinearQuantType::LINEAR_W8A8_DEQUANT || \
         quantType == LinearQuantType::LINEAR_W8A8_SC_DEQUANT) {
         return true;
@@ -275,9 +317,17 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
         if (param.isPrefill) {
             AddTensorToList(latentAttnInTensorCandidates, "attn_cp_prefill", inTensorList);
             AddTensorToList(latentAttnIntermediateTensorCandidates, "attn_cp_prefill", intermediateTensorList);
+            if (!param.skipTopk) {
+                AddTensorToList(latentAttnIntermediateTensorCandidates,
+                    "attn_cp_prefill_indexer", intermediateTensorList);
+            }
             if (param.enablePrefixCacheCP) {
                 AddTensorToList(latentAttnInTensorCandidates, "cp_prefixcache", inTensorList);
                 AddTensorToList(latentAttnIntermediateTensorCandidates, "cp_prefixcache", intermediateTensorList);
+                if (!param.skipTopk) {
+                    AddTensorToList(latentAttnIntermediateTensorCandidates,
+                        "cp_prefixcache_indexer", intermediateTensorList);
+                }
                 // AllGather intermediates only appear when KV is actually
                 // sharded across KV-split ranks (i.e. kvSplitSize > 1). In
                 // local mode the upstream graph skips both the AllGather
@@ -286,6 +336,10 @@ std::map<std::string, uint32_t> ConstructTensorMap(const LatentAttentionParam<No
                 if (!param.enablePrefixCacheLocal) {
                     AddTensorToList(latentAttnIntermediateTensorCandidates,
                                     "cp_prefixcache_allgather", intermediateTensorList);
+                    if (!param.skipTopk) {
+                        AddTensorToList(latentAttnIntermediateTensorCandidates,
+                            "cp_prefixcache_allgather_indexer", intermediateTensorList);
+                    }
                 }
             }
         }
@@ -669,10 +723,7 @@ atb::Status AddLAttnQKVProjNode(const LatentAttentionParam<NormParamType> &param
     atb_speed::common::FusionLinearParam kvAProjNodeParam;
     kvAProjNodeParam.isBF16 = param.isBF16;
     kvAProjNodeParam.hasBias = param.selfAttnHasBias;
-    kvAProjNodeParam.quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED ? \
-            param.packQuantType : param.denseQuantType,
-        param.attnLinearQuantType[Q_PROJ_A_LINEAR_INDEX], true);
+    kvAProjNodeParam.quantType = GetAttnLinearQuantType(param, Q_PROJ_A_LINEAR_INDEX, true);
     if (kvAProjNodeParam.quantType == LinearQuantType::LINEAR_W8A8_DYNAMIC_DEQUANT) {
         kvAProjNodeParam.quantType = LinearQuantType::LINEAR_W8A8_DYNAMIC_QUANT;
     }
@@ -725,10 +776,7 @@ atb::Status AddLAttnQProjANode(const LatentAttentionParam<NormParamType> &param,
     atb_speed::common::FusionLinearParam qAProjNodeParam;
     qAProjNodeParam.isBF16 = param.isBF16;
     qAProjNodeParam.hasBias = param.selfAttnHasBias;
-    qAProjNodeParam.quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED \
-            ? param.packQuantType : param.denseQuantType,
-        param.attnLinearQuantType[Q_PROJ_A_LINEAR_INDEX], true);
+    qAProjNodeParam.quantType = GetAttnLinearQuantType(param, Q_PROJ_A_LINEAR_INDEX, true);
     qAProjNodeParam.quantGroupSize = param.quantGroupSize;
     qAProjNodeParam.transposeType = param.attnLinearTransposeType[Q_PROJ_A_LINEAR_INDEX];
     qAProjNode.inTensorIds = {
@@ -772,10 +820,7 @@ atb::Status AddLAttnQProjBNode(const LatentAttentionParam<NormParamType> &param,
     atb_speed::common::FusionLinearParam qBProjNodeParam;
     qBProjNodeParam.isBF16 = param.isBF16;
     qBProjNodeParam.hasBias = param.selfAttnHasBias;
-    qBProjNodeParam.quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED \
-            ? param.packQuantType : param.denseQuantType,
-        param.attnLinearQuantType[Q_PROJ_B_LINEAR_INDEX], true);
+    qBProjNodeParam.quantType = GetAttnLinearQuantType(param, Q_PROJ_B_LINEAR_INDEX, true);
     if (qBProjNodeParam.quantType == LinearQuantType::LINEAR_W8A8_DYNAMIC_DEQUANT) {
         qBProjNodeParam.quantType = LinearQuantType::LINEAR_W8A8_DYNAMIC_QUANT;
     }
@@ -845,10 +890,7 @@ atb::Status AddReprojQNode(const LatentAttentionParam<NormParamType> &param, atb
     atb_speed::common::FusionLinearParam qReprojNodeParam;
     qReprojNodeParam.isBF16 = param.isBF16;
     qReprojNodeParam.hasBias = param.selfAttnHasBias;
-    qReprojNodeParam.quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED \
-            ? param.packQuantType : param.denseQuantType,
-        param.attnLinearQuantType[KV_PROJ_B_FOR_Q_LINEAR_INDEX], false);
+    qReprojNodeParam.quantType = GetAttnLinearQuantType(param, KV_PROJ_B_FOR_Q_LINEAR_INDEX, false);
     qReprojNodeParam.quantGroupSize = param.quantGroupSize;
     qReprojNodeParam.transposeType = false;
     qReprojNodeParam.enEin = true;
@@ -877,10 +919,7 @@ atb::Status AddLAttnKVAProjNode(const LatentAttentionParam<NormParamType> &param
     atb_speed::common::FusionLinearParam kvAProjNodeParam;
     kvAProjNodeParam.isBF16 = param.isBF16;
     kvAProjNodeParam.hasBias = param.selfAttnHasBias;
-    kvAProjNodeParam.quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED \
-            ? param.packQuantType : param.denseQuantType,
-        param.attnLinearQuantType[KV_PROJ_A_LINEAR_INDEX], true);
+    kvAProjNodeParam.quantType = GetAttnLinearQuantType(param, KV_PROJ_A_LINEAR_INDEX, true);
     kvAProjNodeParam.quantGroupSize = param.quantGroupSize;
     kvAProjNodeParam.transposeType = param.attnLinearTransposeType[KV_PROJ_A_LINEAR_INDEX];
     kvAProjNode.inTensorIds = {
@@ -1047,10 +1086,7 @@ atb::Status AddReprojVNode(const LatentAttentionParam<NormParamType> &param, atb
     atb_speed::common::FusionLinearParam vReprojNodeParam;
     vReprojNodeParam.isBF16 = param.isBF16;
     vReprojNodeParam.hasBias = param.selfAttnHasBias;
-    vReprojNodeParam.quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED \
-            ? param.packQuantType : param.denseQuantType,
-        param.attnLinearQuantType[KV_PROJ_B_FOR_V_LINEAR_INDEX], false);
+    vReprojNodeParam.quantType = GetAttnLinearQuantType(param, KV_PROJ_B_FOR_V_LINEAR_INDEX, false);
     vReprojNodeParam.quantGroupSize = param.quantGroupSize;
     vReprojNodeParam.transposeType = false;
     CHECK_OPERATION_STATUS_RETURN(FusionLinear(vReprojNodeParam, &vReprojNode.operation));
@@ -1188,10 +1224,7 @@ atb::Status SetSelfOutLinearParallelParam(const LatentAttentionParam<NormParamTy
     selfOutLinearParam.parallelType = atb_speed::common::ROW_PARALLEL;
     selfOutLinearParam.fusionLinearParam.isBF16 = param.isBF16;
     selfOutLinearParam.fusionLinearParam.hasBias = param.selfAttnHasBias && !selfOutLinearParam.biasAfterSync;
-    selfOutLinearParam.fusionLinearParam.quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED \
-            ? param.packQuantType : param.denseQuantType,
-        param.attnLinearQuantType[O_LINEAR_INDEX], false);
+    selfOutLinearParam.fusionLinearParam.quantType = GetAttnLinearQuantType(param, O_LINEAR_INDEX, false);
     if (selfOutLinearParam.fusionLinearParam.quantType == LinearQuantType::LINEAR_W8A8_QUANT &&
         param.enableExtraOprojTp) {
         selfOutLinearParam.fusionLinearParam.quantType = LinearQuantType::LINEAR_W8A8_DEQUANT;
@@ -1428,7 +1461,7 @@ atb::Status AddFusedQBNode(const LatentAttentionParam<NormParamType> &param,
     qBProjNodeParam.commDomain = param.lcocAttnTpDomain;
     qBProjNodeParam.quantType = atb::infer::LinearParallelParam::QuantType::QUANT_TYPE_PER_CHANNEL;
     qBProjNodeParam.quantGroupSize = param.quantGroupSize;
-    qBProjNodeParam.outDataType = aclDataType::ACL_FLOAT16;
+    qBProjNodeParam.outDataType = param.isBF16 ? aclDataType::ACL_BF16 : aclDataType::ACL_FLOAT16;
 
     CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(qBProjNodeParam, &qBProjNode.operation));
     qBProjNode.inTensorIds = {
@@ -1475,7 +1508,7 @@ atb::Status AddSelfFusedOutLinearParallelNode(const LatentAttentionParam<NormPar
     selfFusedOutLinearParam.commDomain = param.lcocAttnTpDomain;
     selfFusedOutLinearParam.quantType = atb::infer::LinearParallelParam::QuantType::QUANT_TYPE_PER_CHANNEL;
     selfFusedOutLinearParam.quantGroupSize = param.quantGroupSize;
-    selfFusedOutLinearParam.outDataType = aclDataType::ACL_FLOAT16;
+    selfFusedOutLinearParam.outDataType = param.isBF16 ? aclDataType::ACL_BF16 : aclDataType::ACL_FLOAT16;
 
     CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(selfFusedOutLinearParam,
         &selfFusedOutLinearParallelNode.operation));
@@ -1516,10 +1549,7 @@ atb::Status AddLAttnQProjRecalNode(const LatentAttentionParam<NormParamType> &pa
     atb_speed::common::FusionLinearParam qProjaRecalParam;
     qProjaRecalParam.isBF16 = param.isBF16;
     qProjaRecalParam.hasBias = param.selfAttnHasBias;
-    qProjaRecalParam.quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED ? \
-            param.packQuantType : param.denseQuantType,
-        param.attnLinearQuantType[Q_PROJ_A_LINEAR_INDEX], true);
+    qProjaRecalParam.quantType = GetAttnLinearQuantType(param, Q_PROJ_A_LINEAR_INDEX, true);
     if (qProjaRecalParam.quantType == LinearQuantType::LINEAR_W8A8_DYNAMIC_DEQUANT) {
         qProjaRecalParam.quantType = LinearQuantType::LINEAR_W8A8_DYNAMIC_QUANT;
     }
@@ -1547,9 +1577,15 @@ atb::Status AddIndexerQBNode(const LatentAttentionParam<NormParamType> &param,
     atb::Node qProjbNode;
     atb_speed::common::FusionLinearParam qProjbParam;
     qProjbParam.isBF16 = param.isBF16;
-    qProjbParam.quantType = atb_speed::common::LinearQuantType::NO_QUANT;
+    qProjbParam.quantType =
+        param.attnLinearQuantType.size() > INDEXER_WQ_B_LINEAR_INDEX ?
+            GetAttnLinearQuantType(param, INDEXER_WQ_B_LINEAR_INDEX, false) :
+            atb_speed::common::LinearQuantType::NO_QUANT;
     qProjbParam.quantGroupSize = param.quantGroupSize;
-    qProjbParam.transposeType = param.attnLinearTransposeType[Q_PROJ_B_LINEAR_INDEX];
+    qProjbParam.transposeType = GetLinearTransposeType(
+        param.attnLinearTransposeType,
+        INDEXER_WQ_B_LINEAR_INDEX,
+        param.attnLinearTransposeType[Q_PROJ_B_LINEAR_INDEX]);
     qProjbNode.inTensorIds = {
         GetTensorIdx(tensorMap, {"intermediate_indexer_qa_norm"}),
         GetTensorIdx(tensorMap, "in_indexer_proj_wq_b_weight"),
@@ -1598,7 +1634,10 @@ atb::Status AddIndexerKNode(const LatentAttentionParam<NormParamType> &param,
     kProjNodeParam.isBF16 = param.isBF16;
     kProjNodeParam.quantType = atb_speed::common::LinearQuantType::NO_QUANT;
     kProjNodeParam.quantGroupSize = param.quantGroupSize;
-    kProjNodeParam.transposeType = param.attnLinearTransposeType[Q_PROJ_B_LINEAR_INDEX];
+    kProjNodeParam.transposeType = GetLinearTransposeType(
+        param.attnLinearTransposeType,
+        INDEXER_WK_LINEAR_INDEX,
+        param.attnLinearTransposeType[Q_PROJ_B_LINEAR_INDEX]);
     kProjNode.inTensorIds = {
         GetTensorIdx(tensorMap, "intermediate_indexer_input_norm"),
         GetTensorIdx(tensorMap, "in_indexer_proj_wk_weight"),
@@ -1754,7 +1793,10 @@ atb::Status AddIndexerWeightNode(const LatentAttentionParam<NormParamType> &para
     indexerWeightParam.isBF16 = param.isBF16;
     indexerWeightParam.quantType = atb_speed::common::LinearQuantType::NO_QUANT;
     indexerWeightParam.quantGroupSize = param.quantGroupSize;
-    indexerWeightParam.transposeType = param.attnLinearTransposeType[Q_PROJ_B_LINEAR_INDEX];
+    indexerWeightParam.transposeType = GetLinearTransposeType(
+        param.attnLinearTransposeType,
+        INDEXER_PROJ_LINEAR_INDEX,
+        param.attnLinearTransposeType[Q_PROJ_B_LINEAR_INDEX]);
     indexerWeightNode.inTensorIds = {
         GetTensorIdx(tensorMap, "intermediate_indexer_input_norm"),
         GetTensorIdx(tensorMap, "in_indexer_proj_weight"),
@@ -1928,8 +1970,10 @@ atb::Status AddSparseFlashAttentionCpNode(
         "rope_q_o", "rope_q_o_balance", "cp_load_balance_idx"));
     CHECK_OPERATION_STATUS_RETURN(AddSfaSplitCpNode(param, opGraph, tensorMap,
         "rope_q_o_balance", "rope_q_o_prev", "rope_q_o_next"));
+    std::string topk_indices = param.skipTopk ? "in_shared_topk_indices" :
+        (param.outputTopk ? "out_topk_indices" : "intermediate_topk_indices");
     CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
-        "intermediate_topk_indices", "intermediate_topk_indices_balance", "cp_load_balance_idx"));
+        topk_indices, "intermediate_topk_indices_balance", "cp_load_balance_idx"));
     //CHECK_OPERATION_STATUS_RETURN(AddSfaSplitCpNode(param, opGraph, tensorMap,
     //    "intermediate_topk_indices_balance", "intermediate_topk_indices_prev", "intermediate_topk_indices_next"));
     
@@ -2137,10 +2181,6 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
                 "intermediate_indexer_k_out", "indexer_k_out_allgather", "indexer_k_out_allgather_s", "cp_kv_recover_idx"));
         }
         CHECK_OPERATION_STATUS_RETURN(AddIndexerKReshapeAndCacheNode(param, opGraph, tensorMap));
-    } else {
-        // TODO: support DSA top-k sharing for CP prefill.
-        CHECK(!(param.contextParallelInfo.IsEnabled() && param.isPrefill))
-            << "DSA top-k sharing does not support CP prefill yet.";
     }
 
     // CP + PrefixCache: load prefix from cache, AllGather, and Concat with current.
@@ -2156,8 +2196,10 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
             "in_k_cache", "prefix_kv", /*target_dim_num=*/3));
         CHECK_OPERATION_STATUS_RETURN(AddPrefixCacheGatherNode(param, opGraph, tensorMap,
             "in_k_rope_cache", "prefix_k_rope", /*target_dim_num=*/2));
-        CHECK_OPERATION_STATUS_RETURN(AddPrefixCacheGatherNode(param, opGraph, tensorMap,
-            "in_k_cache_indexer", "prefix_indexer_k", /*target_dim_num=*/2));
+        if (!param.skipTopk) {
+            CHECK_OPERATION_STATUS_RETURN(AddPrefixCacheGatherNode(param, opGraph, tensorMap,
+                "in_k_cache_indexer", "prefix_indexer_k", /*target_dim_num=*/2));
+        }
 
         // enablePrefixCacheLocal: every CP rank already owns the full KV
         // (kvSplitInfo.worldSize == 1) so the prefix AllGather is a no-op.
@@ -2170,33 +2212,37 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
         // vs. stacked-rank collapse) - see its body.
         const char *kv_prefix_src = "prefix_kv_allgather";
         const char *k_rope_prefix_src = "prefix_k_rope_allgather";
-        const char *indexer_prefix_src = "prefix_indexer_k_allgather";
         if (!param.enablePrefixCacheLocal) {
             CHECK_OPERATION_STATUS_RETURN(AddPrefixAllGatherCpNode(param, opGraph, tensorMap,
                 "prefix_kv", "prefix_kv_allgather"));
             CHECK_OPERATION_STATUS_RETURN(AddPrefixAllGatherCpNode(param, opGraph, tensorMap,
                 "prefix_k_rope", "prefix_k_rope_allgather"));
-            CHECK_OPERATION_STATUS_RETURN(AddPrefixAllGatherCpNode(param, opGraph, tensorMap,
-                "prefix_indexer_k", "prefix_indexer_k_allgather"));
+            if (!param.skipTopk) {
+                CHECK_OPERATION_STATUS_RETURN(AddPrefixAllGatherCpNode(param, opGraph, tensorMap,
+                    "prefix_indexer_k", "prefix_indexer_k_allgather"));
+            }
         } else {
             kv_prefix_src = "prefix_kv";
             k_rope_prefix_src = "prefix_k_rope";
-            indexer_prefix_src = "prefix_indexer_k";
         }
 
         CHECK_OPERATION_STATUS_RETURN(AddPrefixConcatCpNode(param, opGraph, tensorMap,
             kv_prefix_src, "intermediate_kv", "merged_kv"));
         CHECK_OPERATION_STATUS_RETURN(AddPrefixConcatCpNode(param, opGraph, tensorMap,
             k_rope_prefix_src, "rope_k_o", "merged_k_rope"));
-        CHECK_OPERATION_STATUS_RETURN(AddPrefixConcatCpNode(param, opGraph, tensorMap,
-            indexer_prefix_src, "indexer_k_out_allgather_s", "merged_indexer_k"));
+        if (!param.skipTopk) {
+            const char *indexer_prefix_src = param.enablePrefixCacheLocal ?
+                "prefix_indexer_k" : "prefix_indexer_k_allgather";
+            CHECK_OPERATION_STATUS_RETURN(AddPrefixConcatCpNode(param, opGraph, tensorMap,
+                indexer_prefix_src, "indexer_k_out_allgather_s", "merged_indexer_k"));
+        }
     }
 
     if (!param.skipTopk) {
         CHECK_OPERATION_STATUS_RETURN(AddIndexerWeightNode(param, opGraph, tensorMap));
     }
 
-    if (param.contextParallelInfo.IsEnabled() && param.isPrefill) {
+    if (param.contextParallelInfo.IsEnabled() && param.isPrefill && !param.skipTopk) {
         // q/weight rerank - "cp_load_balance_idx"
         CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
             "intermediate_indexer_q_out", "indexer_q_out_balance", "cp_load_balance_idx"));
@@ -2220,8 +2266,9 @@ atb::Status Preprocess(const LatentAttentionParam<NormParamType> &param,
         // intermediate_topk_indices_prev_cat intermediate_topk_indices_next_cat
 
         // index & cat & rerank - "cp_o_recover_idx"
+        std::string topk_output = param.outputTopk ? "out_topk_indices" : "intermediate_topk_indices";
         CHECK_OPERATION_STATUS_RETURN(AddSfaGatherCpNode(param, opGraph, tensorMap,
-            "intermediate_topk_indices_draft", "intermediate_topk_indices", "cp_o_recover_idx"));
+            "intermediate_topk_indices_draft", topk_output, "cp_o_recover_idx"));
     } else if (!param.skipTopk) {
         CHECK_OPERATION_STATUS_RETURN(AddLightIndexerNode(param, opGraph, tensorMap));
     }

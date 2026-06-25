@@ -1932,10 +1932,6 @@ atb::Status DecoderLayer(DecoderLayerParam &param, atb::Operation **operation)
         << "DSA top-k sharing requires index_n_heads > 0.";
     CHECK(!(param.skipTopk && param.outputTopk))
         << "DSA top-k sharing does not support skip and output in the same layer.";
-    const bool isCpPrefill = param.mapping.Get(base::ATTN_CP).IsEnabled() && param.isPrefill;
-    // TODO: support DSA top-k sharing for CP prefill.
-    CHECK(!((param.skipTopk || param.outputTopk) && isCpPrefill))
-        << "DSA top-k sharing does not support CP prefill yet.";
     CHECK(!(param.outputTopk && param.isPrefill && FLAGS_enable_multi_stream_parallel))
         << "DSA top-k sharing does not support multi stream prefill yet.";
     std::map<std::string, uint32_t> tensorMap = ConstructTensorMap(
