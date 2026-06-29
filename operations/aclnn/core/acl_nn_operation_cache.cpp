@@ -41,6 +41,7 @@ void AclNNOpCache::Destroy()
     // Non-repeatable executors are not tracked by ExecutorManager and are
     // auto-released by CANN after execution; just drop our (dangling) handle.
     this->aclExecutor = nullptr;
+    this->executorRepeatable = false;
 
     // translatedaclExecutortranslated
     for (size_t i = 0; i < this->aclnnVariantPack.aclInTensors.size(); ++i) {
