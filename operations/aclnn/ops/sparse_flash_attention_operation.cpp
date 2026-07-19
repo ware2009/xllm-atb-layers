@@ -28,7 +28,7 @@ uint32_t SparseFlashAttentionOperation::GetInputNum() const
     return 9; // query, key, weight, seq_len_query, seq_len_key, block_table
 }
 
-uint32_t SparseFlashAttentionOperation::GetOutputNum() const { return 1; }
+uint32_t SparseFlashAttentionOperation::GetOutputNum() const { return 3; }
 
 atb::Status SparseFlashAttentionOperation::InferShape(const atb::SVector<atb::TensorDesc> &inTensorDesc,
                                                         atb::SVector<atb::TensorDesc> &outTensorDesc) const
