@@ -57,19 +57,19 @@ target_include_directories(xllm_atb_layers PRIVATE
   $ENV{PYTORCH_NPU_INSTALL_PATH}/include
   $ENV{NPU_HOME_PATH}/include
   $ENV{ATB_HOME_PATH}/include
-  $ENV{NPU_HOME_PATH}/opp/vendors/xllm/op_api/include/ 
+  $ENV{NPU_HOME_PATH}/opp/vendors/custom_xllm_math/op_api/include/aclnnop
 )
-## Adapt to the modification in DeekSeekV4 where the installation path of xllm_ops has been changed to custom_xllm_math 
-if(EXISTS "$ENV{NPU_HOME_PATH}/opp/vendors/custom_xllm_math/op_api/include/aclnnop")
-target_include_directories(xllm_atb_layers PRIVATE
-  $ENV{NPU_HOME_PATH}/opp/vendors/custom_xllm_math/op_api/include/aclnnop 
-)
-endif()
-
+# The header file path for CANN 9.0 operators:
+# cann-9.0.0/x86_64-linux/include/ or cann-9.0.0/arm64-linux/include/
 if(DEFINED VCPKG_TARGET_TRIPLET)
   target_include_directories(xllm_atb_layers PRIVATE
     "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include"
+    $ENV{NPU_HOME_PATH}/$ENV{VCPKG_TARGET_TRIPLET}/include/aclnnop
   )
+else()
+   target_include_directories(xllm_atb_layers PRIVATE
+    $ENV{NPU_HOME_PATH}/$ENV{VCPKG_DEFAULT_TRIPLET}/include/aclnnop
+  ) 
 endif()
 
 if(DEFINED XLLM_ATB_LAYERS_STAGE_LIB_DIR)
