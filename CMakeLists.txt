@@ -61,10 +61,25 @@ target_include_directories(xllm_atb_layers PRIVATE
 )
 # The header file path for CANN 9.0 operators:
 # cann-9.0.0/x86_64-linux/include/ or cann-9.0.0/arm64-linux/include/
+<<<<<<< HEAD
+=======
+# CANN names its x86 arch dir "x86_64-linux", but the vcpkg triplet is "x64-linux";
+# translate so the aclnnop headers resolve on x86_64 hosts (arm64-linux already matches).
+>>>>>>> 405311cc2e0bb4cdfadbc2ab5bf13893a8f3ca2d
 if(DEFINED VCPKG_TARGET_TRIPLET)
+  string(REPLACE "x64-linux" "x86_64-linux" CANN_ARCH_DIR "${VCPKG_TARGET_TRIPLET}")
   target_include_directories(xllm_atb_layers PRIVATE
     "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include"
+<<<<<<< HEAD
     $ENV{NPU_HOME_PATH}/$ENV{VCPKG_TARGET_TRIPLET}/include/aclnnop
+=======
+    $ENV{NPU_HOME_PATH}/${CANN_ARCH_DIR}/include/aclnnop
+  )
+else()
+  string(REPLACE "x64-linux" "x86_64-linux" CANN_ARCH_DIR "$ENV{VCPKG_DEFAULT_TRIPLET}")
+  target_include_directories(xllm_atb_layers PRIVATE
+    $ENV{NPU_HOME_PATH}/${CANN_ARCH_DIR}/include/aclnnop
+>>>>>>> 405311cc2e0bb4cdfadbc2ab5bf13893a8f3ca2d
   )
 else()
    target_include_directories(xllm_atb_layers PRIVATE
