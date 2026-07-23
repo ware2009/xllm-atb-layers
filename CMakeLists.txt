@@ -59,14 +59,20 @@ target_include_directories(xllm_atb_layers PRIVATE
   $ENV{ATB_HOME_PATH}/include
   $ENV{NPU_HOME_PATH}/opp/vendors/custom_xllm_math/op_api/include/aclnnop
 )
+
 # CANN names its x86 arch dir "x86_64-linux", but the vcpkg triplet is "x64-linux";
 # translate so the aclnnop headers resolve on x86_64 hosts (arm64-linux already matches).
 if(DEFINED VCPKG_TARGET_TRIPLET)
   string(REPLACE "x64-linux" "x86_64-linux" CANN_ARCH_DIR "${VCPKG_TARGET_TRIPLET}")
   target_include_directories(xllm_atb_layers PRIVATE
     "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include"
-    )
- endif()
+    $ENV{NPU_HOME_PATH}/${CANN_ARCH_DIR}/include/aclnnop
+  )
+else()
+   target_include_directories(xllm_atb_layers PRIVATE
+    $ENV{NPU_HOME_PATH}/$ENV{VCPKG_DEFAULT_TRIPLET}/include/aclnnop
+  ) 
+endif()
 
 if(DEFINED XLLM_ATB_LAYERS_STAGE_LIB_DIR)
   set_target_properties(xllm_atb_layers PROPERTIES
