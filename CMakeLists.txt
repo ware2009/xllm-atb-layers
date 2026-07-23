@@ -69,8 +69,9 @@ if(DEFINED VCPKG_TARGET_TRIPLET)
     $ENV{NPU_HOME_PATH}/${CANN_ARCH_DIR}/include/aclnnop
   )
 else()
-   target_include_directories(xllm_atb_layers PRIVATE
-    $ENV{NPU_HOME_PATH}/$ENV{VCPKG_DEFAULT_TRIPLET}/include/aclnnop
+  string(REPLACE "x64-linux" "x86_64-linux" CANN_ARCH_DIR "$ENV{VCPKG_DEFAULT_TRIPLET}")
+  target_include_directories(xllm_atb_layers PRIVATE
+    $ENV{NPU_HOME_PATH}/${CANN_ARCH_DIR}/include/aclnnop
   ) 
 endif()
 
